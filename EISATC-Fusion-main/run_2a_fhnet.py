@@ -1,4 +1,5 @@
-# main_eeg_bcic2a_ddp.py
+# run_2a_fhnet.py  —  BCICIV-2a + DSTAGNN + DDP + 保存最佳权重
+
 import os
 import numpy as np
 from datetime import timedelta
@@ -18,17 +19,17 @@ from dataLoad.preprocess import get_data, cross_validate
 from DSTAGNN_my import make_model
 
 
-# ================== 一些基础超参数（可以按需再改） ==================
+# ================== 基础超参数 ==================
 NUM_CHANNELS = 22        # EEG 导联数（BCICIV-2a）
-WINDOW_SIZE = 1500       # 每个 trial 的采样点数（2~6s, 4s * 250Hz）
+WINDOW_SIZE = 1000       # 每个 trial 的采样点数（2~6s, 4s * 250Hz）
 NUM_CLASSES = 4          # 四分类 MI
 
-BATCH_SIZE = 4
-EPOCHS_PER_FOLD = 50     # 先给一个适中的值，你可以再往上调
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "4"))
+EPOCHS_PER_FOLD = int(os.environ.get("EPOCHS", "500"))
 K_FOLDS = 5
 LR = 1e-3
 
-# DSTAGNN 的结构参数（目前和 ECG 版保持一致）
+# DSTAGNN 的结构参数（与你给出的保持一致）
 K_CHEB = 2
 NB_BLOCK = 2
 NB_CHEV_FILTER = 64
@@ -47,7 +48,6 @@ def train_one_epoch_eeg(model, loader, optimizer, criterion, device):
     total_samples = 0
 
     is_distributed = dist.is_initialized()
-    rank = dist.get_rank() if is_distributed else 0
 
     for inputs, labels in loader:
         # inputs: (B, 22, 1000)
@@ -91,27 +91,27 @@ def evaluate_eeg(model, loader, criterion, device):
     """评估函数：不使用分布式 sampler，在 rank0 上完整跑一遍即可"""
     model.eval()
     total_loss = 0.0
-    all_preds, all_labels = [], []
+    all_preds = []
+    all_labels = []
 
     with torch.no_grad():
         for inputs, labels in loader:
             inputs = inputs.to(device)
             labels = labels.to(device)
 
-            x_for_dstagnn = inputs.unsqueeze(2)  # (B, 22, 1, 1000)
-
+            x_for_dstagnn = inputs.unsqueeze(2)
             outputs = model(x_for_dstagnn)
             if isinstance(outputs, tuple):
                 outputs = outputs[0]
 
             loss = criterion(outputs, labels)
-            total_loss += loss.item()
+            total_loss += loss.item() * labels.size(0)
 
             preds = torch.argmax(outputs, dim=1)
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
 
-    avg_loss = total_loss / max(1, len(loader))
+    avg_loss = total_loss / max(1, len(all_labels))
     report = classification_report(
         all_labels, all_preds, output_dict=True, zero_division=0
     )
@@ -128,13 +128,9 @@ def evaluate_eeg(model, loader, criterion, device):
 
 # ================== 主函数 ==================
 def main():
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--subject", type=int, default=1,
-                        help="BCICIV-2a 的被试编号（1~9）")
-    args = parser.parse_args()
-    subject = args.subject
+    # 先写死一个 subject，你可以改成从环境变量读：
+    # subject = int(os.environ.get("SUBJECT", "1"))
+    subject = 1
 
     # ------- DDP 基础设置 -------
     local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
@@ -159,8 +155,14 @@ def main():
         if is_distributed:
             print(f"[DDP] world size = {world_size}, local rank = {local_rank}")
 
-    # ------- 1. 读取 EEG 数据（BCICIV-2a） -------
+    # 脚本路径，用于组织数据和模型保存路径
     script_dir = os.path.dirname(os.path.abspath(__file__))
+    # 保存 EEG + DSTAGNN 最佳模型权重的根目录
+    save_root = os.path.join(script_dir, "eeg_bcic2a_dstagnn_ckpts")
+    if rank == 0:
+        os.makedirs(save_root, exist_ok=True)
+
+    # ------- 1. 读取 EEG 数据（BCICIV-2a） -------
     data_dir = os.path.join(script_dir, "dataLoad", "BCICIV_2a") + os.sep
 
     if rank == 0:
@@ -186,6 +188,8 @@ def main():
     adj_mx = np.ones((NUM_CHANNELS, NUM_CHANNELS), dtype=np.float32)
 
     all_fold_metrics = []
+    global_best_f1 = 0.0
+    global_best_info = None
 
     # ------- 3. K 折循环 -------
     for fold_idx, (train_dataset, val_dataset) in enumerate(folds):
@@ -258,6 +262,8 @@ def main():
             num_classes=NUM_CLASSES
         )
 
+        model.to(device)
+
         # DDP / DP 包装
         if is_distributed:
             model = DDP(
@@ -278,6 +284,16 @@ def main():
         best_val_f1 = 0.0
         best_fold_metrics = None
 
+        # 每折单独一个保存目录
+        if rank == 0:
+            fold_save_dir = os.path.join(
+                save_root, f"sub{subject}_fold{fold_idx + 1}"
+            )
+            os.makedirs(fold_save_dir, exist_ok=True)
+            best_model_path = os.path.join(
+                fold_save_dir, "best_val_model.pth"
+            )
+
         # ------- 5. 每折内部训练若干 epoch -------
         for epoch in range(1, EPOCHS_PER_FOLD + 1):
             if is_distributed:
@@ -289,7 +305,7 @@ def main():
                 model, train_loader, optimizer, criterion, device
             )
 
-            # 只在 rank0 上做验证 & 打印
+            # 只在 rank0 上做验证 & 打印 & 保存最佳模型
             if rank == 0:
                 model_for_eval = (model.module
                                   if isinstance(model, (DDP, nn.DataParallel))
@@ -305,15 +321,31 @@ def main():
                     f"Val F1(macro): {val_metrics['f1_macro']:.4f}"
                 )
 
-                # 简单的 early-best 记录
+                # 记录并保存“最佳验证集 F1”的模型权重
                 if val_metrics["f1_macro"] > best_val_f1:
                     best_val_f1 = val_metrics["f1_macro"]
                     best_fold_metrics = val_metrics
+
+                    state = model_for_eval.state_dict()
+                    torch.save(state, best_model_path)
+                    print(
+                        f"  -> 新的最佳模型已保存到 {best_model_path} "
+                        f"(Val F1={best_val_f1:.4f})"
+                    )
 
         # ------- 6. 每折结束后，在 rank0 记录最优结果 -------
         if rank == 0 and best_fold_metrics is not None:
             all_fold_metrics.append(best_fold_metrics)
             print(f"[Fold {fold_idx + 1}] 最佳验证集 F1(macro): {best_val_f1:.4f}")
+
+            if best_val_f1 > global_best_f1:
+                global_best_f1 = best_val_f1
+                global_best_info = {
+                    "subject": subject,
+                    "fold": fold_idx + 1,
+                    "metrics": best_fold_metrics,
+                    "path": best_model_path,
+                }
 
     # ------- 7. 所有折结束后，汇总 K 折性能 -------
     if rank == 0 and len(all_fold_metrics) > 0:
@@ -322,6 +354,13 @@ def main():
         print("\n===== K 折平均结果（验证集）=====")
         print(f"Avg F1(macro): {avg_f1:.4f}")
         print(f"Avg Accuracy : {avg_acc:.4f}")
+
+        if global_best_info is not None:
+            print("\n===== 全局最佳模型信息 =====")
+            print(f"Subject {global_best_info['subject']}, "
+                  f"Fold {global_best_info['fold']}, "
+                  f"Best Val F1: {global_best_info['metrics']['f1_macro']:.4f}")
+            print(f"权重文件路径: {global_best_info['path']}")
 
     # ------- 8. 清理 DDP -------
     if is_distributed:
