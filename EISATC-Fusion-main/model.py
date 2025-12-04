@@ -27,13 +27,14 @@ import torch
 import torch.nn as nn
 from torchinfo import summary
 from torchstat import stat
+
+# ==================== 关键修复：正确导入缺失的类 ====================
 from utils.TemInc_util import TemporalInception
 from utils.CNNMHAS_util import CNNAttention
-from utils.util import Conv2dWithConstraint
+from utils.TCN_util import TemporalConvNet                    # 新增：TCN 模块
+from utils.util import Conv2dWithConstraint, LinearWithConstraint  # 新增：带约束的线性层
+# =====================================================================
 
-
-
-#%%
 class My_Model(nn.Module):
     def __init__(self, eeg_chans=22, samples=1000,
                  kerSize=32, kerSize_Tem=4, F1=16, D=2, poolSize1=8, poolSize2=8,
@@ -42,77 +43,68 @@ class My_Model(nn.Module):
                  dropout_dep=0.1, dropout_temp=0.3, dropout_atten=0.3, dropout_tcn=0.3,
                  n_classes=4, device='cpu'):
         super(My_Model, self).__init__()
-        self.F2 = F1*D
+        self.F2 = F1 * D
 
         # ============================= EEGINC model ============================= 
-        self.temp_conv = Conv2dWithConstraint( # Conv2dWithConstraint( # sincConv
-            in_channels = 1,
-            out_channels= F1,
-            kernel_size = (1, kerSize),
-            stride      = 1,
-            padding     = 'same',
-            bias        = False,
-            max_norm    = .5
+        self.temp_conv = Conv2dWithConstraint(
+            in_channels=1,
+            out_channels=F1,
+            kernel_size=(1, kerSize),
+            stride=1,
+            padding='same',
+            bias=False,
+            max_norm=.5
         )
-        self.bn = nn.BatchNorm2d(num_features=F1) # bn_sinc
+        self.bn = nn.BatchNorm2d(num_features=F1)
 
         self.conv_depth = Conv2dWithConstraint(
-            in_channels = F1,
-            out_channels= F1*D,
-            kernel_size = (eeg_chans,1),
-            groups      = F1,
-            bias        = False,
-            max_norm    = .5
+            in_channels=F1,
+            out_channels=F1*D,
+            kernel_size=(eeg_chans, 1),
+            groups=F1,
+            bias=False,
+            max_norm=.5
         )
         self.bn_depth = nn.BatchNorm2d(num_features=self.F2)
-        self.act_depth = nn.ELU() # inplace=True
-        self.avgpool_depth = nn.AvgPool2d(
-            kernel_size=(1,poolSize1),
-            stride=(1,poolSize1)
-        )
+        self.act_depth = nn.ELU()
+        self.avgpool_depth = nn.AvgPool2d(kernel_size=(1, poolSize1), stride=(1, poolSize1))
         self.drop_depth = nn.Dropout(p=dropout_dep)
 
         self.incept_temp = TemporalInception(
             in_chan     = self.F2,
-            kerSize_1   = (1,kerSize_Tem*4),
-            kerSize_2   = (1,kerSize_Tem*2),
-            kerSize_3   = (1,kerSize_Tem),
+            kerSize_1   = (1, kerSize_Tem*4),
+            kerSize_2   = (1, kerSize_Tem*2),
+            kerSize_3   = (1, kerSize_Tem),
             kerStr      = 1,
             out_chan    = self.F2//4,
-            pool_ker    = (1,3),
+            pool_ker    = (1, 3),
             pool_str    = 1,
             bias        = False,
             max_norm    = .5
         )
         self.bn_temp = nn.BatchNorm2d(num_features=self.F2)
         self.act_temp = nn.ELU()
-        self.avgpool_temp = nn.AvgPool2d(
-            kernel_size=(1,poolSize2),
-            stride=(1,poolSize2)
-        )
+        self.avgpool_temp = nn.AvgPool2d(kernel_size=(1, poolSize2), stride=(1, poolSize2))
         self.drop_temp = nn.Dropout(p=dropout_temp)
 
         # ============================= Decision Fusion model ============================= 
         self.flatten_eeg = nn.Flatten()
         self.liner_eeg = LinearWithConstraint(
-            in_features  = self.F2*(samples//poolSize1//poolSize2),
+            in_features  = self.F2 * (samples // poolSize1 // poolSize2),
             out_features = n_classes,
             max_norm     = .5,
             bias         = True
         )
 
         # ============================= MSA model ============================= 
-        self.layerNorm = nn.LayerNorm(
-            normalized_shape=(samples//poolSize1//poolSize2),
-            eps=1e-6
-        )
+        self.layerNorm = nn.LayerNorm(normalized_shape=(samples // poolSize1 // poolSize2), eps=1e-6)
         self.cnnMSA = CNNAttention(
             dim         = self.F2,
             heads       = heads_num,
             dim_head    = head_dim,
             keral_size  = 3,
             patch_height= 1,
-            patch_width = (samples//poolSize1//poolSize2),
+            patch_width = (samples // poolSize1 // poolSize2),
             dropout     = dropout_atten,
             max_norm1   = .5,
             max_norm2   = .5,
@@ -122,7 +114,7 @@ class My_Model(nn.Module):
 
         # ============================= TCN model ============================= 
         self.tcn_block = TemporalConvNet(
-            num_inputs   = self.F2*2,
+            num_inputs   = self.F2 * 2,
             num_channels = [tcn_filters*2, tcn_filters*2],
             kernel_size  = tcn_kernelSize,
             dropout      = dropout_tcn,
@@ -132,7 +124,7 @@ class My_Model(nn.Module):
             max_norm     = .5
         )
 
-        # ============================= Decision Fusion model ============================= 
+        # ============================= Decision Fusion model (TCN branch) ============================= 
         self.flatten_tcn = nn.Flatten()
         self.liner_tcn = LinearWithConstraint(
             in_features  = tcn_filters*2,
@@ -141,31 +133,17 @@ class My_Model(nn.Module):
             bias         = True
         )
 
-        # ============================= Faeture Fusion model EEG TCN ============================= 
-        # self.flatten_fusion = nn.Flatten()
-        # self.liner_fusion = LinearWithConstraint(
-        #     in_features  = self.F2*((samples//poolSize1//poolSize2)*1+1),
-        #     out_features = n_classes,
-        #     max_norm     = .5,
-        #     bias         = True
-        # )
-
-        # ============================= Decision Fusion model ============================= 
+        # ============================= Decision Fusion 参数 ============================= 
         self.beta = nn.Parameter(torch.randn(1, requires_grad=True))
         self.beta_sigmoid = nn.Sigmoid()
 
-        # self.flatten = nn.Flatten()
-        # self.liner_cla = LinearWithConstraint(
-        #     in_features=self.F2*(samples//poolSize1//poolSize2), # tcn_filters, self.F2*(samples//poolSize1//poolSize2)
-        #     out_features=n_classes,
-        #     max_norm=.5,
-        #     bias=True
-        # )
         self.softmax = nn.Softmax(dim=-1)
 
     def forward(self, x):
-        if len(x.shape) is not 4:
-            x = torch.unsqueeze(x, 1)
+        # ==================== 推荐写法（更安全、更规范） ====================
+        if x.dim() != 4:           # 原来是 len(x.shape) is not 4，已改为推荐写法
+            x = x.unsqueeze(1)
+        # ===================================================================
 
         # ============================= EEGINC model ============================= 
         x = self.temp_conv(x)
@@ -173,70 +151,44 @@ class My_Model(nn.Module):
         x = self.conv_depth(x)
         x = self.drop_depth(self.avgpool_depth(self.act_depth(self.bn_depth(x))))
         x = self.incept_temp(x)
-        x = self.drop_temp(self.avgpool_temp(self.act_temp(self.bn_temp(x)))) # (batch, F1*D, 1, 15)
+        x = self.drop_temp(self.avgpool_temp(self.act_temp(self.bn_temp(x))))  # (B, F2, 1, T)
 
-        # eegFatures = torch.squeeze(x, dim=2) # (batch, F1*D, 15)
-        eegFatures = x
+        eegFatures = x   # (B, F2, 1, T)
 
-        # ============================= Decision Fusion model ============================= 
-        eeg_out = self.liner_eeg(self.flatten_eeg(x))
+        # ============================= EEG 分支分类 ============================= 
+        eeg_out = self.liner_eeg(self.flatten_eeg(x))   # (B, n_classes)
 
         # ============================= MSA model ============================= 
         x = self.layerNorm(x)
-        x = self.cnnMSA(x)
-        # x, attention_cycle, attention, cycle_attn = self.cnnMSA(x, mode="test") # (batch, F1*D, 1, 15)
-
-        # msaFatures = torch.squeeze(x, dim=2) # (batch, F1*D, 15)
+        x = self.cnnMSA(x)               # (B, F2, 1, T)
         msaFatures = x
 
-        # ============================= Feature Fusion model ============================= 
-        fusionFeature = torch.cat((eegFatures, msaFatures), dim=1)
+        # ============================= Feature Fusion ============================= 
+        fusionFeature = torch.cat((eegFatures, msaFatures), dim=1)   # (B, F2*2, 1, T)
 
         # ============================= TCN model ============================= 
-        x = torch.squeeze(fusionFeature, dim=2) # (batch, F1*D, 15)
-        x = self.tcn_block(x)
-        x = x[:, :, -1]
-        tcnFeature = x # (batch, F1*D)
+        x = torch.squeeze(fusionFeature, dim=2)   # (B, F2*2, T)
+        x = self.tcn_block(x)                     # (B, tcn_filters*2, T)
+        x = x[:, :, -1]                           # 取最后一个时间步 (B, tcn_filters*2)
+        tcnFeature = x
 
-        # tcnFeature = torch.unsqueeze(tcnFeature, 2)
-        # fusionFeature = torch.cat((tcnFeature, eegFatures), dim=2)
-        # fusionFeature_out = self.liner_fusion(self.flatten_fusion(fusionFeature))
+        tcn_out = self.liner_tcn(self.flatten_tcn(tcnFeature))   # (B, n_classes)
 
-        # ============================= Decision Fusion model ============================= 
-        tcn_out = self.liner_tcn(self.flatten_tcn(tcnFeature))
+        # ============================= 决策融合 ============================= 
+        fusionDecision = self.beta_sigmoid(self.beta) * eeg_out + \
+                        (1 - self.beta_sigmoid(self.beta)) * tcn_out
 
-        # ============================= Decision Fusion model ============================= 
-        fusionDecision = self.beta_sigmoid(self.beta)*eeg_out + (1-self.beta_sigmoid(self.beta))*tcn_out
-
-        # x = self.flatten(x)
-        # fusionDecision = self.liner_cla(x) # (batch, n_classes)
         out = self.softmax(fusionDecision)
 
-        # return out, eegFatures, msaFatures, fusionFeature
-        # return out, eeg_out, tcn_out, fusionDecision
-        # return out, attention_cycle, attention, cycle_attn
-        # return out, fusionDecision
         return out
-        
 
 
-#%%
-###============================ Initialization parameters ============================###
-channels = 22
-samples = 1000
-
-###============================ main function ============================###
-def main():
-    input = torch.randn(32, channels, samples)
-    model = My_Model(eeg_chans=22, n_classes=4)
+# ============================== 测试代码 ==============================
+if __name__ == "__main__":
+    input = torch.randn(32, 22, 1000)          # (batch, channels, samples)
+    model = My_Model(eeg_chans=22, samples=1000, n_classes=4, device='cpu')
     out = model(input)
     print('===============================================================')
-    print('out', out.shape)
-    # print('attention_scores', attention_scores.shape)
-    print('model', model)
-    # summary(model=model, input_size=(1,1,channels,samples), device="cpu")
-    stat(model, (1, channels, samples))
-
-if __name__ == "__main__":
-    main()
-
+    print('output shape:', out.shape)         # 应该输出 torch.Size([32, 4])
+    print('model forward success! No NameError anymore!')
+    stat(model, (1, 22, 1000))
