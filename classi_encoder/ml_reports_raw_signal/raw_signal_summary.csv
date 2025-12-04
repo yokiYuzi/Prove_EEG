@@ -1,0 +1,4 @@
+model,auc_mean,accuracy_mean,f1_mean,balanced_accuracy_mean
+logreg,0.5222,0.4667,0.0667,0.4333
+rf,0.4889,0.4667,0.1800,0.4500
+svm,0.5667,0.4200,0.2743,0.4333

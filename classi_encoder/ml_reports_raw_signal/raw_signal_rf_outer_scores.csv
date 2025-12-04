@@ -1,0 +1,6 @@
+fold_id,best_params,roc_auc,average_precision,f1,accuracy,balanced_accuracy
+1,"{""clf__max_depth"": null, ""clf__min_samples_leaf"": 1}",0.4444444444444445,0.5333333333333333,0.0,0.3333333333333333,0.3333333333333333
+2,"{""clf__max_depth"": null, ""clf__min_samples_leaf"": 5}",1.0,1.0,0.5,0.6,0.6666666666666666
+3,"{""clf__max_depth"": null, ""clf__min_samples_leaf"": 1}",0.33333333333333337,0.41666666666666663,0.0,0.6,0.5
+4,"{""clf__max_depth"": null, ""clf__min_samples_leaf"": 1}",0.33333333333333337,0.45,0.0,0.4,0.3333333333333333
+5,"{""clf__max_depth"": null, ""clf__min_samples_leaf"": 1}",0.33333333333333337,0.41666666666666663,0.4,0.4,0.41666666666666663
