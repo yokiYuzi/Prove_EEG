@@ -1,4 +1,4 @@
-# run_2a_fhnet.py  —  BCICIV-2a + DSTAGNN + DDP + 保存最佳权重
+# run_2a_fhnet.py  —  BCICIV-2a + DSTAGNN + DDP + 保存最佳权重 + 小模型 + AdamW + label_smoothing + Cosine LR + 真实 EEG 10-20 拓扑
 
 import os
 import numpy as np
@@ -25,18 +25,88 @@ WINDOW_SIZE = 1000       # 每个 trial 的采样点数（2~6s, 4s * 250Hz）
 NUM_CLASSES = 4          # 四分类 MI
 
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "4"))
-EPOCHS_PER_FOLD = int(os.environ.get("EPOCHS", "500"))
+EPOCHS_PER_FOLD = int(os.environ.get("EPOCHS", "200"))
 K_FOLDS = 5
 LR = 1e-3
 
-# DSTAGNN 的结构参数（与你给出的保持一致）
+# DSTAGNN 的结构参数（EEG 专用小模型版，容量约为原版的 1/4~1/5）
 K_CHEB = 2
-NB_BLOCK = 2
-NB_CHEV_FILTER = 64
-D_MODEL_ATTN = 64
-N_HEADS_ATTN = 4
-DSTAGNN_D_K_ATTN = 16
-DSTAGNN_D_V_ATTN = 16
+NB_BLOCK = 1           # 块数降到 1
+NB_CHEV_FILTER = 32    # Cheb滤波器数量 32
+D_MODEL_ATTN = 32      # 空间注意力 d_model 32
+N_HEADS_ATTN = 2       # 多头数 2
+DSTAGNN_D_K_ATTN = 8   # d_k = 8
+DSTAGNN_D_V_ATTN = 8   # d_v = 8
+
+
+# ========= EEG 通道拓扑（BCICIV-2a, 22 导联） =========
+CHANNELS_2A = [
+    "Fz",
+    "FC3", "FC1", "FCz", "FC2", "FC4",
+    "C3",  "C1",  "Cz",  "C2",  "C4",
+    "CP3", "CP1", "CPz", "CP2", "CP4",
+    "P3",  "P1",  "Pz",  "P2",  "P4",
+    "POz",
+]
+
+# 粗略 2D 坐标（行 = 前后，列 = 左右），只用来计算相对距离
+CHAN_POS_2A = {
+    "Fz":  (0, 2),
+
+    "FC3": (1, 0), "FC1": (1, 1), "FCz": (1, 2),
+    "FC2": (1, 3), "FC4": (1, 4),
+
+    "C3":  (2, 0), "C1":  (2, 1), "Cz":  (2, 2),
+    "C2":  (2, 3), "C4":  (2, 4),
+
+    "CP3": (3, 0), "CP1": (3, 1), "CPz": (3, 2),
+    "CP2": (3, 3), "CP4": (3, 4),
+
+    "P3":  (4, 0), "P1":  (4, 1), "Pz":  (4, 2),
+    "P2":  (4, 3), "P4":  (4, 4),
+
+    "POz": (5, 2),
+}
+
+
+def build_eeg_2a_adj(num_channels: int,
+                     connect_thresh: float = 1.5,
+                     self_loop: bool = True) -> np.ndarray:
+    """
+    根据 BCICIV-2a 的 10-20 布局构造 EEG 邻接矩阵。
+
+    参数
+    ----
+    num_channels : 实际使用的通道数（这里应为 22）
+    connect_thresh : 空间距离阈值，小于等于该值的两点视为相邻
+    self_loop : 是否保留自环（对图卷积和拉普拉斯较稳定，建议 True）
+
+    返回
+    ----
+    adj : (num_channels, num_channels) 的对称邻接矩阵
+    """
+    assert num_channels == len(CHANNELS_2A), \
+        f"num_channels={num_channels} 与 CHANNELS_2A 数量 {len(CHANNELS_2A)} 不一致"
+
+    name_to_idx = {ch: i for i, ch in enumerate(CHANNELS_2A)}
+    adj = np.zeros((num_channels, num_channels), dtype=np.float32)
+
+    for ch_i, (ri, ci) in CHAN_POS_2A.items():
+        i = name_to_idx[ch_i]
+        for ch_j, (rj, cj) in CHAN_POS_2A.items():
+            j = name_to_idx[ch_j]
+            if i == j:
+                continue
+            dist = np.sqrt((ri - rj) ** 2 + (ci - cj) ** 2)
+            if dist <= connect_thresh:
+                w = 1.0
+                adj[i, j] = max(adj[i, j], w)
+                adj[j, i] = max(adj[j, i], w)
+
+    if self_loop:
+        np.fill_diagonal(adj, 1.0)
+
+    return adj
 
 
 # ================== 训练 & 评估函数 ==================
@@ -184,8 +254,11 @@ def main():
     if rank == 0:
         print(f"K 折 = {K_FOLDS}，每折都会重新初始化模型并训练。")
 
-    # 简单的静态邻接矩阵：先用全 1，后续你可以换成基于导联空间位置的图
-    adj_mx = np.ones((NUM_CHANNELS, NUM_CHANNELS), dtype=np.float32)
+    # ------- 2. 准备图结构：基于 10-20 布局的 EEG 拓扑 -------
+    adj_mx = build_eeg_2a_adj(NUM_CHANNELS)
+
+    # 同一张图既给 Chebyshev 卷积用，也给 DSTAGNN 的静态空间图用
+    # （如果以后你想做多图融合，可以再单独定义 adj_pa_static / adj_TMD_static）
 
     all_fold_metrics = []
     global_best_f1 = 0.0
@@ -278,8 +351,20 @@ def main():
                 print(f"[多卡] 启用 DataParallel，GPU 数量: {torch.cuda.device_count()}")
             model = nn.DataParallel(model)
 
-        optimizer = optim.Adam(model.parameters(), lr=LR)
-        criterion = nn.CrossEntropyLoss()
+        # ================== 优化器、损失、学习率调度器（关键修改） ==================
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=LR,
+            weight_decay=1e-2          # 强 L2 正则，防过拟合
+        )
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)   # label smoothing，对小样本非常有效
+
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=EPOCHS_PER_FOLD,     # 每个 fold 独立一个周期
+            eta_min=1e-5               # 最小学习率，可选
+        )
+        # ===========================================================================
 
         best_val_f1 = 0.0
         best_fold_metrics = None
@@ -297,13 +382,15 @@ def main():
         # ------- 5. 每折内部训练若干 epoch -------
         for epoch in range(1, EPOCHS_PER_FOLD + 1):
             if is_distributed:
-                # 保证每个 epoch sampler 的 shuffle 一致但不同 epoch 不同
                 if hasattr(train_loader.sampler, "set_epoch"):
                     train_loader.sampler.set_epoch(epoch)
 
             train_loss, train_acc = train_one_epoch_eeg(
                 model, train_loader, optimizer, criterion, device
             )
+
+            # 学习率调度器 step（每个 epoch 结束后）
+            scheduler.step()
 
             # 只在 rank0 上做验证 & 打印 & 保存最佳模型
             if rank == 0:
@@ -318,7 +405,8 @@ def main():
                     f"[Fold {fold_idx + 1}] Epoch {epoch}/{EPOCHS_PER_FOLD} | "
                     f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f} | "
                     f"Val Loss: {val_metrics['loss']:.4f}, "
-                    f"Val F1(macro): {val_metrics['f1_macro']:.4f}"
+                    f"Val F1(macro): {val_metrics['f1_macro']:.4f} | "
+                    f"LR: {optimizer.param_groups[0]['lr']:.6f}"
                 )
 
                 # 记录并保存“最佳验证集 F1”的模型权重
