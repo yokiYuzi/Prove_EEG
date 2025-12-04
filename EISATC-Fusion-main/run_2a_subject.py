@@ -11,10 +11,14 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # 这里改成你在 Linux 上的实际路径，注意最后有 '/'
-    data_path = "/home/你的用户名/EISATC-Fusion-main/dataLoad/BCICIV_2a/"
+    # 用当前脚本所在目录推算 dataLoad/BCICIV_2a 的路径
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    data_path = os.path.join(current_dir, "dataLoad", "BCICIV_2a") + "/"
 
     subject = 1      # 先从被试 1 开始做，后面可以 for 循环跑 1~9
     n_classes = 4    # 2a 是四分类
+
+    
 
     # 2. 读取并预处理数据（自动完成裁剪 & 标准化）
     X_train, y_train, X_test, y_test, X_train_trans, y_train_trans = \
