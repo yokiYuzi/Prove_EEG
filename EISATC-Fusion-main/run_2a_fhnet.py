@@ -20,7 +20,7 @@ from DSTAGNN_my import make_model
 
 # ================== 一些基础超参数（可以按需再改） ==================
 NUM_CHANNELS = 22        # EEG 导联数（BCICIV-2a）
-WINDOW_SIZE = 1000       # 每个 trial 的采样点数（2~6s, 4s * 250Hz）
+WINDOW_SIZE = 1500       # 每个 trial 的采样点数（2~6s, 4s * 250Hz）
 NUM_CLASSES = 4          # 四分类 MI
 
 BATCH_SIZE = 4
