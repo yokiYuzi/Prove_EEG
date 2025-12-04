@@ -23,7 +23,7 @@ NUM_CHANNELS = 22        # EEG 导联数（BCICIV-2a）
 WINDOW_SIZE = 1000       # 每个 trial 的采样点数（2~6s, 4s * 250Hz）
 NUM_CLASSES = 4          # 四分类 MI
 
-BATCH_SIZE = 8
+BATCH_SIZE = 4
 EPOCHS_PER_FOLD = 50     # 先给一个适中的值，你可以再往上调
 K_FOLDS = 5
 LR = 1e-3
