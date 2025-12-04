@@ -15,5 +15,5 @@ torchrun \
   --nnodes=1 \
   --nproc_per_node=8 \
   --master_port=${MASTER_PORT} \
-  main_eeg_bcic2a_ddp.py \
+  run_2a_fhnet.py \
   --subject "${SUBJECT}"
