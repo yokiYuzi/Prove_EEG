@@ -124,7 +124,10 @@ def train_one_epoch_eeg(model, loader, optimizer, criterion, device):
         inputs = inputs.to(device)
         labels = labels.to(device)
 
-        # (B, 22, 1000) -> (B, N, 1, T)
+        # 下采样到 250Hz
+        inputs = inputs[:, :, ::4]  # (B, 22, 1000) -> (B, 22, 250)
+
+        # (B, 22, 250) -> (B, N, 1, T)
         x_for_dstagnn = inputs.unsqueeze(2)
 
         optimizer.zero_grad()
