@@ -21,12 +21,12 @@ from DSTAGNN_my import make_model
 
 # ================== 基础超参数 ==================
 NUM_CHANNELS = 22
-WINDOW_SIZE = 250                  # 模型输入时间长度
+WINDOW_SIZE = 1000                  # 模型输入时间长度
 NUM_CLASSES = 4
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "4"))
 N_EPOCHS = int(os.environ.get("EPOCHS", "200"))   # 原来的 EPOCHS_PER_FOLD 改名更清晰
 LR = 1e-3
-VAL_RATIO = 0.2                    # 从 Session T 中划分 20% 做验证集
+VAL_RATIO = 0.1                    # 从 Session T 中划分 10% 做验证集
 
 # DSTAGNN 小模型参数
 K_CHEB = 2
@@ -112,7 +112,7 @@ def train_one_epoch_eeg(model, loader, optimizer, criterion, device):
         inputs = inputs.to(device)          # (B, 22, 1000)
         labels = labels.to(device)
 
-        inputs = prepare_eeg_for_dstagnn(inputs)   # → (B, 22, 250)
+        #inputs = prepare_eeg_for_dstagnn(inputs)   # → (B, 22, 250)
         x = inputs.unsqueeze(2)                     # (B, N, 1, T)
 
         optimizer.zero_grad()
