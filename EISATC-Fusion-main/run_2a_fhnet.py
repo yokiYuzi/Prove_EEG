@@ -1,4 +1,5 @@
-# run_2a_fhnet.py  —  BCICIV-2a + DSTAGNN + DDP + 保存最佳权重 + 小模型 + AdamW + label_smoothing + Cosine LR + 真实 EEG 10-20 拓扑
+# run_2a_fhnet.py  —  BCICIV-2a 官方协议版：Train on Session T, Test on Session E
+# DSTAGNN + 真实 EEG 10-20 拓扑 + 小模型 + AdamW + label_smoothing + Cosine LR + 250点
 
 import os
 import numpy as np
@@ -10,75 +11,53 @@ import torch.optim as optim
 import torch.distributed as dist
 
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
-
+from torch.utils.data import DataLoader, TensorDataset, DistributedSampler
 from sklearn.metrics import classification_report
+from sklearn.model_selection import StratifiedShuffleSplit
 
-from dataLoad.preprocess import get_data, cross_validate
+from dataLoad.preprocess import get_data
 from DSTAGNN_my import make_model
 
 
 # ================== 基础超参数 ==================
-NUM_CHANNELS = 22        # EEG 导联数（BCICIV-2a）
-WINDOW_SIZE = 250       # 每个 trial 真正喂进模型的时间长度（我们现在用 250）
-NUM_CLASSES = 4          # 四分类 MI
-
+NUM_CHANNELS = 22
+WINDOW_SIZE = 250                  # 模型输入时间长度
+NUM_CLASSES = 4
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "4"))
-EPOCHS_PER_FOLD = int(os.environ.get("EPOCHS", "200"))
-K_FOLDS = 5
+N_EPOCHS = int(os.environ.get("EPOCHS", "200"))   # 原来的 EPOCHS_PER_FOLD 改名更清晰
 LR = 1e-3
+VAL_RATIO = 0.2                    # 从 Session T 中划分 20% 做验证集
 
-# DSTAGNN 的结构参数（EEG 专用小模型版，容量约为原版的 1/4~1/5）
+# DSTAGNN 小模型参数
 K_CHEB = 2
-NB_BLOCK = 1           # 块数降到 1
-NB_CHEV_FILTER = 32    # Cheb滤波器数量 32
+NB_BLOCK = 1
+NB_CHEV_FILTER = 32
 NB_TIME_FILTER_BLOCK_UNUSED = 32
-D_MODEL_ATTN = 32      # 空间注意力 d_model 32
-N_HEADS_ATTN = 2       # 多头数 2
-DSTAGNN_D_K_ATTN = 8   # d_k = 8
-DSTAGNN_D_V_ATTN = 8   # d_v = 8
+D_MODEL_ATTN = 32
+N_HEADS_ATTN = 2
+DSTAGNN_D_K_ATTN = 8
+DSTAGNN_D_V_ATTN = 8
 
 
-# ========= EEG 通道拓扑（BCICIV-2a, 22 导联） =========
+# ========= EEG 通道真实 10-20 拓扑 =========
 CHANNELS_2A = [
-    "Fz",
-    "FC3", "FC1", "FCz", "FC2", "FC4",
+    "Fz", "FC3", "FC1", "FCz", "FC2", "FC4",
     "C3",  "C1",  "Cz",  "C2",  "C4",
     "CP3", "CP1", "CPz", "CP2", "CP4",
-    "P3",  "P1",  "Pz",  "P2",  "P4",
-    "POz",
+    "P3",  "P1",  "Pz",  "P2",  "P4", "POz",
 ]
 
-# 粗略 2D 坐标（行 = 前后，列 = 左右），只用来计算相对距离
 CHAN_POS_2A = {
     "Fz":  (0, 2),
-
-    "FC3": (1, 0), "FC1": (1, 1), "FCz": (1, 2),
-    "FC2": (1, 3), "FC4": (1, 4),
-
-    "C3":  (2, 0), "C1":  (2, 1), "Cz":  (2, 2),
-    "C2":  (2, 3), "C4":  (2, 4),
-
-    "CP3": (3, 0), "CP1": (3, 1), "CPz": (3, 2),
-    "CP2": (3, 3), "CP4": (3, 4),
-
-    "P3":  (4, 0), "P1":  (4, 1), "Pz":  (4, 2),
-    "P2":  (4, 3), "P4":  (4, 4),
-
+    "FC3": (1, 0), "FC1": (1, 1), "FCz": (1, 2), "FC2": (1, 3), "FC4": (1, 4),
+    "C3":  (2, 0), "C1":  (2, 1), "Cz":  (2, 2), "C2":  (2, 3), "C4":  (2, 4),
+    "CP3": (3, 0), "CP1": (3, 1), "CPz": (3, 2), "CP2": (3, 3), "CP4": (3, 4),
+    "P3":  (4, 0), "P1":  (4, 1), "Pz":  (4, 2), "P2":  (4, 3), "P4":  (4, 4),
     "POz": (5, 2),
 }
 
 
-def build_eeg_2a_adj(num_channels: int,
-                     connect_thresh: float = 1.5,
-                     self_loop: bool = True) -> np.ndarray:
-    """
-    根据 BCICIV-2a 的 10-20 布局构造 EEG 邻接矩阵。
-    """
-    assert num_channels == len(CHANNELS_2A), \
-        f"num_channels={num_channels} 与 CHANNELS_2A 数量 {len(CHANNELS_2A)} 不一致"
-
+def build_eeg_2a_adj(num_channels: int = 22, connect_thresh: float = 1.5, self_loop: bool = True) -> np.ndarray:
     name_to_idx = {ch: i for i, ch in enumerate(CHANNELS_2A)}
     adj = np.zeros((num_channels, num_channels), dtype=np.float32)
 
@@ -90,67 +69,54 @@ def build_eeg_2a_adj(num_channels: int,
                 continue
             dist = np.sqrt((ri - rj) ** 2 + (ci - cj) ** 2)
             if dist <= connect_thresh:
-                w = 1.0
-                adj[i, j] = max(adj[i, j], w)
-                adj[j, i] = max(adj[j, i], w)
+                adj[i, j] = 1.0
+                adj[j, i] = 1.0
 
     if self_loop:
         np.fill_diagonal(adj, 1.0)
-
     return adj
 
 
-# ================== 新增：统一输入时间长度工具函数 ==================
+# ================== 输入统一处理：1000 → 250 ==================
 def prepare_eeg_for_dstagnn(inputs: torch.Tensor) -> torch.Tensor:
     """
-    把原始 (B, 22, T_raw) 的 EEG 数据统一处理成 (B, 22, WINDOW_SIZE)。
-    当前场景：T_raw = 1000 → 250（每4点取1点）。
-    以后如果想改回 1000，只需要把 WINDOW_SIZE 改成 1000，此函数会直接原样返回。
+    (B, 22, 1000) or any T → (B, 22, WINDOW_SIZE=250)
     """
     B, C, T = inputs.shape
-    assert C == NUM_CHANNELS, f"通道数不匹配，期望 {NUM_CHANNELS}，实际 {C}"
+    assert C == NUM_CHANNELS
 
     if T == WINDOW_SIZE:
         return inputs
-
-    if T == 1000 and WINDOW_SIZE == 250:           # 经典 BCICIV-2a 下采样情形
-        return inputs[:, :, ::4]                    # 1000 → 250（250Hz → 62.5Hz 等效）
-
-    if T > WINDOW_SIZE and T % WINDOW_SIZE == 0:   # 可整除，直接下采样
+    if T == 1000 and WINDOW_SIZE == 250:
+        return inputs[:, :, ::4]
+    if T > WINDOW_SIZE and T % WINDOW_SIZE == 0:
         stride = T // WINDOW_SIZE
         return inputs[:, :, ::stride]
-
-    if T > WINDOW_SIZE:                             # 不能整除，居中裁剪
+    if T > WINDOW_SIZE:
         start = (T - WINDOW_SIZE) // 2
-        end = start + WINDOW_SIZE
-        return inputs[:, :, start:end]
-
-    # T < WINDOW_SIZE（目前不会发生），补零
+        return inputs[:, :, start:start + WINDOW_SIZE]
+    # T < WINDOW_SIZE → pad
     pad_len = WINDOW_SIZE - T
     return torch.nn.functional.pad(inputs, (0, pad_len))
 
 
-# ================== 训练 & 评估函数 ==================
+# ================== 训练 & 验证函数 ==================
 def train_one_epoch_eeg(model, loader, optimizer, criterion, device):
     model.train()
     total_loss = 0.0
     total_correct = 0
     total_samples = 0
-
     is_distributed = dist.is_initialized()
 
     for inputs, labels in loader:
         inputs = inputs.to(device)          # (B, 22, 1000)
         labels = labels.to(device)
 
-        # === 关键：统一到 WINDOW_SIZE ===
         inputs = prepare_eeg_for_dstagnn(inputs)   # → (B, 22, 250)
-
-        # (B, 22, 250) → (B, N, 1, T)
-        x_for_dstagnn = inputs.unsqueeze(2)
+        x = inputs.unsqueeze(2)                     # (B, N, 1, T)
 
         optimizer.zero_grad()
-        outputs = model(x_for_dstagnn)
+        outputs = model(x)
         if isinstance(outputs, tuple):
             outputs = outputs[0]
 
@@ -158,42 +124,33 @@ def train_one_epoch_eeg(model, loader, optimizer, criterion, device):
         loss.backward()
         optimizer.step()
 
-        batch_size = labels.size(0)
-        total_loss += loss.item() * batch_size
+        total_loss += loss.item() * labels.size(0)
         preds = torch.argmax(outputs, dim=1)
         total_correct += (preds == labels).sum().item()
-        total_samples += batch_size
+        total_samples += labels.size(0)
 
     if is_distributed:
-        tensor = torch.tensor(
-            [total_loss, total_correct, total_samples],
-            dtype=torch.float64,
-            device=device
-        )
+        tensor = torch.tensor([total_loss, total_correct, total_samples], dtype=torch.float64, device=device)
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
         total_loss, total_correct, total_samples = tensor.tolist()
 
-    avg_loss = total_loss / max(1, total_samples)
-    avg_acc = total_correct / max(1, total_samples)
-    return avg_loss, avg_acc
+    return total_loss / max(1, total_samples), total_correct / max(1, total_samples)
 
 
 def evaluate_eeg(model, loader, criterion, device):
     model.eval()
     total_loss = 0.0
-    all_preds = []
-    all_labels = []
+    all_preds, all_labels = [], []
 
     with torch.no_grad():
         for inputs, labels in loader:
-            inputs = inputs.to(device)          # (B, 22, 1000)
+            inputs = inputs.to(device)
             labels = labels.to(device)
 
-            # === 关键：验证时也要统一到 WINDOW_SIZE ===
-            inputs = prepare_eeg_for_dstagnn(inputs)   # → (B, 22, 250)
+            inputs = prepare_eeg_for_dstagnn(inputs)
+            x = inputs.unsqueeze(2)
 
-            x_for_dstagnn = inputs.unsqueeze(2)
-            outputs = model(x_for_dstagnn)
+            outputs = model(x)
             if isinstance(outputs, tuple):
                 outputs = outputs[0]
 
@@ -205,32 +162,25 @@ def evaluate_eeg(model, loader, criterion, device):
             all_labels.extend(labels.cpu().numpy())
 
     avg_loss = total_loss / max(1, len(all_labels))
-    report = classification_report(
-        all_labels, all_preds, output_dict=True, zero_division=0
-    )
-    metrics = {
+    report = classification_report(all_labels, all_preds, output_dict=True, zero_division=0)
+    return {
         "loss": avg_loss,
         "accuracy": report["accuracy"],
         "f1_macro": report["macro avg"]["f1-score"],
-        "precision_macro": report["macro avg"]["precision"],
-        "recall_macro": report["macro avg"]["recall"],
         "full_report": report,
     }
-    return metrics
 
 
-# ================== 主函数 ==================
+# ================== 主函数（官方协议版） ==================
 def main():
-    subject = 1
+    subject = 1   # 可改为循环 1~9
 
+    # ----------------- DDP 初始化 -----------------
     local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
     is_distributed = local_rank >= 0
 
     if is_distributed:
-        dist.init_process_group(
-            backend="nccl",
-            timeout=timedelta(hours=12)
-        )
+        dist.init_process_group(backend="nccl", timeout=timedelta(hours=12))
         torch.cuda.set_device(local_rank)
         device = torch.device("cuda", local_rank)
         world_size = dist.get_world_size()
@@ -243,217 +193,134 @@ def main():
     if rank == 0:
         print(f"使用设备: {device}")
         if is_distributed:
-            print(f"[DDP] world size = {world_size}, local rank = {local_rank}")
+            print(f"[DDP] world_size={world_size}, local_rank={local_rank}")
 
+    # ----------------- 路径 -----------------
     script_dir = os.path.dirname(os.path.abspath(__file__))
+    data_dir = os.path.join(script_dir, "dataLoad", "BCICIV_2a") + os.sep
     save_root = os.path.join(script_dir, "eeg_bcic2a_dstagnn_ckpts")
     if rank == 0:
         os.makedirs(save_root, exist_ok=True)
 
-    # ------- 1. 读取 EEG 数据（BCICIV-2a） -------
-    data_dir = os.path.join(script_dir, "dataLoad", "BCICIV_2a") + os.sep
-
-    if rank == 0:
-        print(f"从 {data_dir} 加载被试 {subject} 的 BCICIV-2a 数据...")
-
+    # ----------------- 1. 读取数据（Session T / Session E） -----------------
     X_train, y_train, X_test, y_test, _, _ = get_data(
-        path=data_dir,
-        subject=subject,
-        LOSO=False,
-        data_type='2a'
-    )
+        path=data_dir, subject=subject, LOSO=False, data_type='2a'
+    )   # X_train = Session T, X_test = Session E
 
     if rank == 0:
-        print(f"X_train shape: {X_train.shape}, y_train shape: {y_train.shape}")
+        print(f"Subject {subject} | Session T: {X_train.shape} | Session E: {X_test.shape}")
 
-    # ------- 2. K 折划分 -------
-    folds = list(cross_validate(X_train, y_train, kfold=K_FOLDS))
-    if rank == 0:
-        print(f"K 折 = {K_FOLDS}，每折都会重新初始化模型并训练。")
+    # ----------------- 2. 从 Session T 划分 train / val -----------------
+    sss = StratifiedShuffleSplit(n_splits=1, test_size=VAL_RATIO, random_state=42)
+    train_idx, val_idx = next(sss.split(X_train, y_train))
 
-    # ------- 3. 准备真实 EEG 拓扑图 -------
+    train_dataset = TensorDataset(torch.FloatTensor(X_train[train_idx]), torch.LongTensor(y_train[train_idx]))
+    val_dataset   = TensorDataset(torch.FloatTensor(X_train[val_idx]),   torch.LongTensor(y_train[val_idx]))
+    test_dataset  = TensorDataset(torch.FloatTensor(X_test),            torch.LongTensor(y_test))
+
+    # ----------------- 3. DataLoader -----------------
+    if is_distributed:
+        train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=False)
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, sampler=train_sampler,
+                                  num_workers=4, pin_memory=True, persistent_workers=True)
+    else:
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+                                  num_workers=4, pin_memory=True, persistent_workers=True)
+
+    val_loader  = DataLoader(val_dataset,  batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+
+    # ----------------- 4. 拓扑图 & 模型 -----------------
     adj_mx = build_eeg_2a_adj(NUM_CHANNELS)
 
-    all_fold_metrics = []
-    global_best_f1 = 0.0
-    global_best_info = None
+    model = make_model(
+        DEVICE=device,
+        num_of_d_initial_feat=1,
+        nb_block=NB_BLOCK,
+        initial_in_channels_cheb=1,
+        K_cheb=K_CHEB,
+        nb_chev_filter=NB_CHEV_FILTER,
+        nb_time_filter_block_unused=NB_TIME_FILTER_BLOCK_UNUSED,
+        initial_time_strides=1,
+        adj_mx=adj_mx,
+        adj_pa_static=adj_mx,
+        adj_TMD_static_unused=np.zeros_like(adj_mx),
+        num_for_predict_per_node=1,
+        len_input_total=WINDOW_SIZE,
+        num_of_vertices=NUM_CHANNELS,
+        d_model_for_spatial_attn=D_MODEL_ATTN,
+        d_k_for_attn=DSTAGNN_D_K_ATTN,
+        d_v_for_attn=DSTAGNN_D_V_ATTN,
+        n_heads_for_attn=N_HEADS_ATTN,
+        output_memory=False,
+        return_internal_states=False,
+        task_type="classification",
+        num_classes=NUM_CLASSES
+    ).to(device)
 
-    # ------- 4. K 折循环 -------
-    for fold_idx, (train_dataset, val_dataset) in enumerate(folds):
-        if rank == 0:
-            print(f"\n===== Subject {subject} - Fold {fold_idx + 1}/{K_FOLDS} =====")
-            print(f"Train samples: {len(train_dataset)}, "
-                  f"Val samples: {len(val_dataset)}")
+    if is_distributed:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank,
+                    broadcast_buffers=False, find_unused_parameters=False)
+    elif torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model)
 
-        # DataLoader
+    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-2)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=N_EPOCHS, eta_min=1e-5)
+
+    # ----------------- 5. 训练 -----------------
+    best_val_f1 = 0.0
+    best_model_path = os.path.join(save_root, f"sub{subject}", "best_model_SessionE.pth")
+    if rank == 0:
+        os.makedirs(os.path.dirname(best_model_path), exist_ok=True)
+
+    for epoch in range(1, N_EPOCHS + 1):
         if is_distributed:
-            train_sampler = DistributedSampler(
-                train_dataset,
-                num_replicas=world_size,
-                rank=rank,
-                shuffle=True,
-                drop_last=False
-            )
-            train_loader = DataLoader(
-                train_dataset,
-                batch_size=BATCH_SIZE,
-                sampler=train_sampler,
-                shuffle=False,
-                num_workers=4,
-                pin_memory=True,
-                persistent_workers=True
-            )
-        else:
-            train_loader = DataLoader(
-                train_dataset,
-                batch_size=BATCH_SIZE,
-                shuffle=True,
-                num_workers=4,
-                pin_memory=True,
-                persistent_workers=True
-            )
+            train_loader.sampler.set_epoch(epoch)
 
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=BATCH_SIZE,
-            shuffle=False,
-            num_workers=4,
-            pin_memory=True,
-            persistent_workers=True
-        )
+        train_loss, train_acc = train_one_epoch_eeg(model, train_loader, optimizer, criterion, device)
+        scheduler.step()
 
-        # ------- 5. 构建模型 -------
-        model = make_model(
+        if rank == 0:
+            model_eval = model.module if isinstance(model, (DDP, nn.DataParallel)) else model
+            val_metrics = evaluate_eeg(model_eval, val_loader, criterion, device)
+
+            print(f"[S{subject}] Epoch {epoch:3d}/{N_EPOCHS} | "
+                  f"Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} | "
+                  f"Val Loss: {val_metrics['loss']:.4f} F1: {val_metrics['f1_macro']:.4f}")
+
+            if val_metrics["f1_macro"] > best_val_f1:
+                best_val_f1 = val_metrics["f1_macro"]
+                torch.save(model_eval.state_dict(), best_model_path)
+                print(f"  → 新最佳模型已保存 (Val F1 = {best_val_f1:.4f})")
+
+    # ----------------- 6. 最终在 Session E 上测试 -----------------
+    if rank == 0:
+        final_model = make_model(
             DEVICE=device,
-            num_of_d_initial_feat=1,
-            nb_block=NB_BLOCK,
-            initial_in_channels_cheb=1,
-            K_cheb=K_CHEB,
-            nb_chev_filter=NB_CHEV_FILTER,
+            num_of_d_initial_feat=1, nb_block=NB_BLOCK, initial_in_channels_cheb=1,
+            K_cheb=K_CHEB, nb_chev_filter=NB_CHEV_FILTER,
             nb_time_filter_block_unused=NB_TIME_FILTER_BLOCK_UNUSED,
-            initial_time_strides=1,
-            adj_mx=adj_mx,
-            adj_pa_static=adj_mx,
+            initial_time_strides=1, adj_mx=adj_mx, adj_pa_static=adj_mx,
             adj_TMD_static_unused=np.zeros_like(adj_mx),
-            num_for_predict_per_node=1,
-            len_input_total=WINDOW_SIZE,           # ← 250
+            num_for_predict_per_node=1, len_input_total=WINDOW_SIZE,
             num_of_vertices=NUM_CHANNELS,
             d_model_for_spatial_attn=D_MODEL_ATTN,
-            d_k_for_attn=DSTAGNN_D_K_ATTN,
-            d_v_for_attn=DSTAGNN_D_V_ATTN,
+            d_k_for_attn=DSTAGNN_D_K_ATTN, d_v_for_attn=DSTAGNN_D_V_ATTN,
             n_heads_for_attn=N_HEADS_ATTN,
-            output_memory=False,
-            return_internal_states=False,
-            task_type="classification",
-            num_classes=NUM_CLASSES
-        )
+            task_type="classification", num_classes=NUM_CLASSES
+        ).to(device)
 
-        model.to(device)
+        final_model.load_state_dict(torch.load(best_model_path, map_location=device))
+        final_model.eval()
 
-        if is_distributed:
-            model = DDP(
-                model,
-                device_ids=[local_rank],
-                output_device=local_rank,
-                broadcast_buffers=False,
-                find_unused_parameters=False
-            )
-        elif torch.cuda.device_count() > 1:
-            if rank == 0:
-                print(f"[多卡] 启用 DataParallel，GPU 数量: {torch.cuda.device_count()}")
-            model = nn.DataParallel(model)
+        test_metrics = evaluate_eeg(final_model, test_loader, criterion, device)
 
-        # ================== 优化器、损失、调度器 ==================
-        optimizer = optim.AdamW(
-            model.parameters(),
-            lr=LR,
-            weight_decay=1e-2
-        )
-        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=EPOCHS_PER_FOLD,
-            eta_min=1e-5
-        )
-
-        best_val_f1 = 0.0
-        best_fold_metrics = None
-
-        if rank == 0:
-            fold_save_dir = os.path.join(
-                save_root, f"sub{subject}_fold{fold_idx + 1}"
-            )
-            os.makedirs(fold_save_dir, exist_ok=True)
-            best_model_path = os.path.join(
-                fold_save_dir, "best_val_model.pth"
-            )
-
-        # ------- 6. 训练循环 -------
-        for epoch in range(1, EPOCHS_PER_FOLD + 1):
-            if is_distributed:
-                if hasattr(train_loader.sampler, "set_epoch"):
-                    train_loader.sampler.set_epoch(epoch)
-
-            train_loss, train_acc = train_one_epoch_eeg(
-                model, train_loader, optimizer, criterion, device
-            )
-
-            scheduler.step()
-
-            if rank == 0:
-                model_for_eval = (model.module
-                                  if isinstance(model, (DDP, nn.DataParallel))
-                                  else model)
-
-                val_metrics = evaluate_eeg(
-                    model_for_eval, val_loader, criterion, device
-                )
-                print(
-                    f"[Fold {fold_idx + 1}] Epoch {epoch}/{EPOCHS_PER_FOLD} | "
-                    f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f} | "
-                    f"Val Loss: {val_metrics['loss']:.4f}, "
-                    f"Val F1(macro): {val_metrics['f1_macro']:.4f} | "
-                    f"LR: {optimizer.param_groups[0]['lr']:.6f}"
-                )
-
-                if val_metrics["f1_macro"] > best_val_f1:
-                    best_val_f1 = val_metrics["f1_macro"]
-                    best_fold_metrics = val_metrics
-
-                    state = model_for_eval.state_dict()
-                    torch.save(state, best_model_path)
-                    print(
-                        f"  -> 新的最佳模型已保存到 {best_model_path} "
-                        f"(Val F1={best_val_f1:.4f})"
-                    )
-
-        if rank == 0 and best_fold_metrics is not None:
-            all_fold_metrics.append(best_fold_metrics)
-            print(f"[Fold {fold_idx + 1}] 最佳验证集 F1(macro): {best_val_f1:.4f}")
-
-            if best_val_f1 > global_best_f1:
-                global_best_f1 = best_val_f1
-                global_best_info = {
-                    "subject": subject,
-                    "fold": fold_idx + 1,
-                    "metrics": best_fold_metrics,
-                    "path": best_model_path,
-                }
-
-    # ------- 7. K折汇总 -------
-    if rank == 0 and len(all_fold_metrics) > 0:
-        avg_f1 = np.mean([m["f1_macro"] for m in all_fold_metrics])
-        avg_acc = np.mean([m["accuracy"] for m in all_fold_metrics])
-        print("\n===== K 折平均结果（验证集）=====")
-        print(f"Avg F1(macro): {avg_f1:.4f}")
-        print(f"Avg Accuracy : {avg_acc:.4f}")
-
-        if global_best_info is not None:
-            print("\n===== 全局最佳模型信息 =====")
-            print(f"Subject {global_best_info['subject']}, "
-                  f"Fold {global_best_info['fold']}, "
-                  f"Best Val F1: {global_best_info['metrics']['f1_macro']:.4f}")
-            print(f"权重文件路径: {global_best_info['path']}")
+        print("\n" + "="*60)
+        print(f"Subject {subject} 最终结果（Session E 测试集，官方协议）")
+        print(f"Accuracy : {test_metrics['accuracy']:.4f}")
+        print(f"F1(macro): {test_metrics['f1_macro']:.4f}")
+        print("="*60)
 
     if is_distributed:
         dist.destroy_process_group()
