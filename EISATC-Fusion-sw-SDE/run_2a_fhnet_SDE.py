@@ -1,5 +1,5 @@
-# run_2a_fhnet.py  —  BCICIV-2a 官方协议版：Train on Session T, Test on Session E
-# DSTAGNN + 真实 EEG 10-20 拓扑 + 小模型 + AdamW + label_smoothing + Cosine LR + 250点
+# run_2a_fhnet_SDE.py  —  BCICIV-2a 官方协议版：Train on Session T, Test on Session E
+# DSTAGNN + 真实 EEG 10-20 拓扑 + 小模型 + AdamW + label_smoothing + Cosine LR + 1000点（滑窗增强版）
 
 import os
 import numpy as np
@@ -21,10 +21,15 @@ from DSTAGNN_my import make_model
 
 # ================== 基础超参数 ==================
 NUM_CHANNELS = 22
-WINDOW_SIZE = 1000                  # 模型输入时间长度
+
+FS = 250                        # 采样率 250 Hz
+WIN_SEC = 4.0                   # 每个样本的时间长度（秒）→ 1000 点
+STEP_SEC = 0.1                  # 滑动步长（秒），用于数据增强
+WINDOW_SIZE = int(WIN_SEC * FS) # = 1000，模型输入时间长度
+
 NUM_CLASSES = 4
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "4"))
-N_EPOCHS = int(os.environ.get("EPOCHS", "200"))   # 原来的 EPOCHS_PER_FOLD 改名更清晰
+N_EPOCHS = int(os.environ.get("EPOCHS", "200"))
 LR = 1e-3
 VAL_RATIO = 0.1                    # 从 Session T 中划分 10% 做验证集
 
@@ -77,27 +82,16 @@ def build_eeg_2a_adj(num_channels: int = 22, connect_thresh: float = 1.5, self_l
     return adj
 
 
-# ================== 输入统一处理：1000 → 250 ==================
+# ================== 输入统一处理：现在是恒等映射（固定 1000 点） ==================
 def prepare_eeg_for_dstagnn(inputs: torch.Tensor) -> torch.Tensor:
     """
-    (B, 22, 1000) or any T → (B, 22, WINDOW_SIZE=250)
+    当前设置下：确保形状为 (B, 22, 1000)，直接返回。
+    如果以后想重新做下采样或变长输入，再改这里的逻辑。
     """
     B, C, T = inputs.shape
-    assert C == NUM_CHANNELS
-
-    if T == WINDOW_SIZE:
-        return inputs
-    if T == 1000 and WINDOW_SIZE == 250:
-        return inputs[:, :, ::4]
-    if T > WINDOW_SIZE and T % WINDOW_SIZE == 0:
-        stride = T // WINDOW_SIZE
-        return inputs[:, :, ::stride]
-    if T > WINDOW_SIZE:
-        start = (T - WINDOW_SIZE) // 2
-        return inputs[:, :, start:start + WINDOW_SIZE]
-    # T < WINDOW_SIZE → pad
-    pad_len = WINDOW_SIZE - T
-    return torch.nn.functional.pad(inputs, (0, pad_len))
+    assert C == NUM_CHANNELS, f"expected {NUM_CHANNELS} channels, got {C}"
+    assert T == WINDOW_SIZE, f"expected length {WINDOW_SIZE}, got {T}"
+    return inputs
 
 
 # ================== 训练 & 验证函数 ==================
@@ -112,8 +106,8 @@ def train_one_epoch_eeg(model, loader, optimizer, criterion, device):
         inputs = inputs.to(device)          # (B, 22, 1000)
         labels = labels.to(device)
 
-        #inputs = prepare_eeg_for_dstagnn(inputs)   # → (B, 22, 250)
-        x = inputs.unsqueeze(2)                     # (B, N, 1, T)
+        # 现在已经是 1000 点，无需任何下采样/裁剪
+        x = inputs.unsqueeze(2)             # (B, N, 1, T=1000)
 
         optimizer.zero_grad()
         outputs = model(x)
@@ -147,7 +141,7 @@ def evaluate_eeg(model, loader, criterion, device):
             inputs = inputs.to(device)
             labels = labels.to(device)
 
-            inputs = prepare_eeg_for_dstagnn(inputs)
+            inputs = prepare_eeg_for_dstagnn(inputs)   # 恒等映射 + 形状检查
             x = inputs.unsqueeze(2)
 
             outputs = model(x)
@@ -202,13 +196,20 @@ def main():
     if rank == 0:
         os.makedirs(save_root, exist_ok=True)
 
-    # ----------------- 1. 读取数据（Session T / Session E） -----------------
+    # ----------------- 1. 读取数据（Session T / Session E） + 滑动窗口增强 -----------------
     X_train, y_train, X_test, y_test, _, _ = get_data(
-        path=data_dir, subject=subject, LOSO=False, data_type='2a'
-    )   # X_train = Session T, X_test = Session E
+        path=data_dir,
+        subject=subject,
+        LOSO=False,
+        data_type='2a',
+        use_sliding_window=True,    # ★ 开启滑动窗口增强（只对 Session T）
+        win_sec=WIN_SEC,            # ★ 4.0 秒 → 1000 点窗
+        step_sec=STEP_SEC           # ★ 0.1 秒步长
+    )   # X_train = Session T（已滑窗增强）, X_test = Session E（原始 288 trials）
 
     if rank == 0:
-        print(f"Subject {subject} | Session T: {X_train.shape} | Session E: {X_test.shape}")
+        print(f"Subject {subject} | Session T (after sliding window): {X_train.shape}")
+        print(f"Subject {subject} | Session E: {X_test.shape}")
 
     # ----------------- 2. 从 Session T 划分 train / val -----------------
     sss = StratifiedShuffleSplit(n_splits=1, test_size=VAL_RATIO, random_state=42)
@@ -246,7 +247,7 @@ def main():
         adj_pa_static=adj_mx,
         adj_TMD_static_unused=np.zeros_like(adj_mx),
         num_for_predict_per_node=1,
-        len_input_total=WINDOW_SIZE,
+        len_input_total=WINDOW_SIZE,          # ← 1000
         num_of_vertices=NUM_CHANNELS,
         d_model_for_spatial_attn=D_MODEL_ATTN,
         d_k_for_attn=DSTAGNN_D_K_ATTN,

@@ -50,9 +50,49 @@ def standardize_data_onLine2a(X_train, channels):
     return X_train
 
 
+#%% 新增：滑动窗口数据增强函数
+def sliding_window_augment(X, y, fs=250, win_sec=2.0, step_sec=0.1):
+    """
+    对 4 秒 trial 做滑动窗口增强。
+    参数
+    ----
+    X: np.ndarray, 形状 (n_trial, n_chan, T) ，T≈1000
+    y: np.ndarray, 形状 (n_trial,)
+    fs: 采样率, 默认 250 Hz
+    win_sec: 窗口长度（秒），默认 2s -> 500 samples
+    step_sec: 步长（秒），默认 0.1s -> 25 samples
+
+    返回
+    ----
+    X_out: (n_trial * n_win, n_chan, win_len)
+    y_out: (n_trial * n_win,)
+    n_win: 每个原 trial 产生的窗口数
+    """
+    n_trial, n_chan, T = X.shape
+    win_len = int(round(win_sec * fs))
+    step = int(round(step_sec * fs))
+
+    assert win_len <= T, f"window length {win_len} > trial length {T}"
+
+    n_win = (T - win_len) // step + 1
+    X_out = np.zeros((n_trial * n_win, n_chan, win_len), dtype=X.dtype)
+    y_out = np.zeros((n_trial * n_win,), dtype=y.dtype)
+
+    idx = 0
+    for i in range(n_trial):
+        for start in range(0, T - win_len + 1, step):
+            X_out[idx] = X[i, :, start:start + win_len]
+            y_out[idx] = y[i]
+            idx += 1
+
+    return X_out, y_out, n_win
+
 
 #%%
-def get_data(path, subject=None, LOSO=False, Transfer=False, trans_num=1, onLine_2a=False,  data_model='one_session', isStandard=True, data_type='2a'):
+def get_data(path, subject=None, LOSO=False, Transfer=False, trans_num=1,
+             onLine_2a=False, data_model='one_session',
+             isStandard=True, data_type='2a',
+             use_sliding_window=False, win_sec=2.0, step_sec=0.1):
     # Define dataset parameters
     fs = 250          # sampling rate
     t1 = int(2*fs)    # start time_point
@@ -85,19 +125,32 @@ def get_data(path, subject=None, LOSO=False, Transfer=False, trans_num=1, onLine
 
     # Prepare training data
     N_tr, N_ch, samples = X_train.shape 
-    if  data_type == '2a':
+    if data_type == '2a':
         X_train = X_train[:, :, t1:t2]
-        y_train = y_train-1
+        y_train = y_train - 1
+
+    # === 只对训练集做滑动窗口增强 ===
+    if use_sliding_window and (not onLine_2a) and data_type == '2a':
+        X_train, y_train, n_win = sliding_window_augment(
+            X_train, y_train,
+            fs=fs, win_sec=win_sec, step_sec=step_sec
+        )
+        print(f"[DataAug] sliding window: win={int(win_sec*fs)} samples, "
+              f"step={int(step_sec*fs)} samples -> {n_win} windows/trial, "
+              f"X_train shape = {X_train.shape}")
+
+        # 更新形状变量，保证后面的 standardize 能正确运行
+        N_tr, N_ch, samples = X_train.shape
 
     # Prepare testing data 
     if onLine_2a == False:
-        if  data_type == '2a':
+        if data_type == '2a':
             X_test = X_test[:, :, t1:t2]
-            y_test = y_test-1
+            y_test = y_test - 1
 
     if Transfer:
         X_train_trans = X_train_trans[:, :, t1:t2]
-        y_train_trans = y_train_trans-1
+        y_train_trans = y_train_trans - 1
     else:
         X_train_trans = []
         y_train_trans = []
