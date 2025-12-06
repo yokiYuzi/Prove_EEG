@@ -110,7 +110,7 @@ def plot_eeg_segment(data_seg, fs, title_prefix="Train", channel_names=None):
 def main():
     # ======= 1. 基本参数（你只需要改这几行） =======
     # 确保和训练时传给 get_data 的 path 保持一致
-    dataset_root = r"/mnt/sdb/home/changw11/Prove_EEG/EISATC-Fusion-main/dataLoad/BCICIV_2a"  # <-- 修改为你数据集根目录（包含 s1, s2, ...）
+    dataset_root = r"/mnt/sdb/home/changw11/Prove_EEG/EISATC-Fusion-main/dataLoad/BCICIV_2a/"  # <-- 修改为你数据集根目录（包含 s1, s2, ...）
     subject = 1                             # <-- 要看的被试编号
     data_type = "2a"                        # <-- "2a" 或 "2b"
 
