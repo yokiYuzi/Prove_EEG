@@ -6,7 +6,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import TensorDataset
 
-from preprocess import get_data
+# ========= 关键修改 1：从 dataLoad.preprocess 导入 =========
+from dataLoad.preprocess import get_data
 from model import My_Model
 from functions import train_with_cross_validate, validate_model
 
@@ -19,13 +20,13 @@ def run_subject_2a(subject, data_path, save_root, device):
     X_train, y_train, X_test, y_test, _, _ = get_data(
         path=data_path,
         subject=subject,
-        data_type='2a'  # 明确指定一下
+        data_type='2a'  # 明确指定 2a
     )
 
     print(f"Train shape: {X_train.shape}, Test shape: {X_test.shape}")
 
     # 2) 构建 EISATC-Fusion 模型
-    n_chans  = X_train.shape[1]
+    n_chans = X_train.shape[1]
     n_samples = X_train.shape[2]
     n_classes = 4
 
@@ -45,7 +46,7 @@ def run_subject_2a(subject, data_path, save_root, device):
     train_with_cross_validate(
         model_name="EISATC_Fusion_2a",
         subject=subject,
-        frist_epochs=3000,      # 第一阶段 3000 epoch
+        frist_epochs=3000,      # 第一阶段 3000 epoch（按论文）
         eary_stop_epoch=300,    # ES 容忍 300 epoch
         second_epochs=800,      # 第二阶段 800 epoch
         kfolds=5,               # 论文设定：5-fold cross-validation
@@ -81,19 +82,39 @@ def run_subject_2a(subject, data_path, save_root, device):
 
 
 if __name__ == "__main__":
-    # 修改成你机器上的实际路径
-    data_path = "/mnt/sdb/home/changw11/Prove_EEG/EISATC-Fusion-main/dataLoad/BCICIV_2a_mat/"
-    save_root = "./Saved_files/BCIC_2a/within_subject/EISATC_Fusion/"
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--subject",
+        type=int,
+        default=-1,
+        help="被试编号 1-9；默认 -1 表示跑所有被试"
+    )
+    args = parser.parse_args()
+
+    # ========= 关键修改 2：自动拼接 dataLoad/BCICIV_2a 路径 =========
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    data_path = os.path.join(project_root, "dataLoad", "BCICIV_2a") + os.sep
+
+    save_root = os.path.join(project_root, "Saved_files", "BCIC_2a", "within_subject", "EISATC_Fusion")
     os.makedirs(save_root, exist_ok=True)
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    all_acc = []
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    for sub in range(1, 9 + 1):
+    # 决定要跑哪些 subject
+    if args.subject == -1:
+        subjects = range(1, 10)      # 跑 1~9 所有被试
+    else:
+        subjects = [args.subject]    # 只跑一个被试
+
+    all_acc = []
+    for sub in subjects:
         acc = run_subject_2a(sub, data_path, save_root, device)
         all_acc.append(acc)
 
-    all_acc = np.array(all_acc)
-    print("\n========== Summary on BCI-2a (within-subject) ==========")
-    print("Per-subject acc (%):", np.round(all_acc * 100, 2))
-    print(f"Mean ± Std: {all_acc.mean()*100:.2f} ± {all_acc.std()*100:.2f}")
+    if len(all_acc) > 1:
+        all_acc = np.array(all_acc)
+        print("\n========== Summary on BCI-2a (within-subject) ==========")
+        print("Per-subject acc (%):", np.round(all_acc * 100, 2))
+        print(f"Mean ± Std: {all_acc.mean()*100:.2f} ± {all_acc.std()*100:.2f}")
