@@ -16,7 +16,7 @@ from sklearn.metrics import classification_report
 from sklearn.model_selection import StratifiedShuffleSplit
 
 from dataLoad.preprocess import get_data
-from DSTAGNN_my1 import make_model
+from DSTAGNN_my import make_model
 
 
 # ================== 基础超参数 ==================

@@ -104,13 +104,14 @@ def plot_eeg_segment(data_seg, fs, title_prefix="Train", channel_names=None):
         fontsize=14,
     )
     fig.tight_layout(rect=[0, 0.03, 1, 0.95])
-    plt.show()
+    
+    return fig  # 返回 fig 对象，以便后续保存
 
 
 def main():
     # ======= 1. 基本参数（你只需要改这几行） =======
     # 确保和训练时传给 get_data 的 path 保持一致
-    dataset_root = r"/mnt/sdb/home/changw11/Prove_EEG/EISATC-Fusion-main/dataLoad/BCICIV_2a/"  # <-- 修改为你数据集根目录（包含 s1, s2, ...）
+    dataset_root = r"C:/Users/zhaib/Desktop/GNN4Attention_data prediction/EEG-prove/EISATC-Fusion-main/dataLoad/BCICIV_2a/"  # 使用前向斜杠并添加尾部斜杠以修正路径拼接问题
     subject = 1                             # <-- 要看的被试编号
     data_type = "2a"                        # <-- "2a" 或 "2b"
 
@@ -153,7 +154,7 @@ def main():
     #   2a: load_data_2a 取 7s 窗，但在 get_data 中裁成 2~6s（4 秒）
     #   2b: get_epochs_* 中 tmin=0, tmax=4，得到 4 秒数据:contentReference[oaicite:4]{index=4}
     if data_type in ["2a", "2b"]:
-        mi_window_sec = 4.0  # 每个 trial 的长度（秒）
+        mi_window_sec = 1  # 每个 trial 的长度（秒）
         fs = int(round(T / mi_window_sec))
     else:
         # 兜底：假设 fs=250（和 preprocess.py 里一致），同时给出提示
@@ -163,7 +164,7 @@ def main():
     print(f"推算采样率 fs = {fs} Hz, 单 trial 长度约 {T / fs:.2f} 秒")
 
     # ======= 4. 拼接出前 60 秒的连续数据 =======
-    seconds = 60
+    seconds = 0.5
     train_seg = build_continuous_segment(X_train, fs, seconds=seconds)
     test_seg = build_continuous_segment(X_test, fs, seconds=seconds)
 
@@ -185,11 +186,25 @@ def main():
         print(f"[提示] 通道数为 {n_ch}，与预设的 2a/2b 通道数不一致，将使用默认 Ch1, Ch2, ... 命名。")
         ch_names = None
 
+    # ======= 添加保存功能：创建新的文件夹 =======
+    output_dir = os.path.join(current_path, "eeg_plots")
+    os.makedirs(output_dir, exist_ok=True)
+
     # ======= 6. 画图：Train 前 60 秒 =======
-    plot_eeg_segment(train_seg, fs, title_prefix="Train", channel_names=ch_names)
+    fig_train = plot_eeg_segment(train_seg, fs, title_prefix="Train", channel_names=ch_names)
+    train_save_path = os.path.join(output_dir, f"train_subject_{subject}.png")
+    fig_train.savefig(train_save_path, dpi=300, bbox_inches='tight')
+    plt.show()  # 仍然显示图像
+    plt.close(fig_train)  # 关闭图以释放内存
 
     # ======= 7. 画图：Test 前 60 秒 =======
-    plot_eeg_segment(test_seg, fs, title_prefix="Test", channel_names=ch_names)
+    fig_test = plot_eeg_segment(test_seg, fs, title_prefix="Test", channel_names=ch_names)
+    test_save_path = os.path.join(output_dir, f"test_subject_{subject}.png")
+    fig_test.savefig(test_save_path, dpi=300, bbox_inches='tight')
+    plt.show()  # 仍然显示图像
+    plt.close(fig_test)  # 关闭图以释放内存
+
+    print(f"图像已保存至: {output_dir}")
 
 
 if __name__ == "__main__":
