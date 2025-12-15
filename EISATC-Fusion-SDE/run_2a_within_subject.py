@@ -35,7 +35,7 @@ def run_subject_2a(subject, data_path, save_root, device):
         samples=n_samples,
         n_classes=n_classes,
         device=device,
-        use_sde=False  # EISATC-Fusion 不使用 SDE
+        use_sde=True  # EISATC-Fusion 不使用 SDE
     ).to(device)
 
     criterion = nn.CrossEntropyLoss()
