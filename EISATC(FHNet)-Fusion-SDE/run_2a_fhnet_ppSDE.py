@@ -40,7 +40,7 @@ DSTAGNN_D_V_ATTN = 8
 
 # STFT 频带特征提取参数
 FS = 250
-BANDS = [(8,12), (12,16), (16,20), (20,28)]   # 先用4段更稳
+BANDS = [(8, 12), (12, 16), (16, 20), (20, 28)]   # 先用4段更稳
 N_BANDS = len(BANDS)
 
 N_FFT = 256
@@ -51,7 +51,8 @@ EPS = 1e-6
 BASE_FRAMES = 3   # 约 3*HOP/FS ≈ 0.384s（你也可以调成 4~6）
 
 # 计算 T_FRAMES（STFT 输出时间帧数）
-T_FRAMES = (1000 - WIN) // HOP + 1   # center=False 时
+# 注意：torch.stft 在 center=False 时，帧数由 n_fft 决定（而不是 win_length）。
+T_FRAMES = (1000 + (N_FFT if CENTER else 0) - N_FFT) // HOP + 1   # frames = floor((L + pad - n_fft)/hop)+1
 
 
 # ========= EEG 通道真实 10-20 拓扑 =========
@@ -82,8 +83,8 @@ def build_eeg_2a_adj(num_channels: int = 22, connect_thresh: float = 1.5, self_l
             j = name_to_idx[ch_j]
             if i == j:
                 continue
-            dist = np.sqrt((ri - rj) ** 2 + (ci - cj) ** 2)
-            if dist <= connect_thresh:
+            dist_ = np.sqrt((ri - rj) ** 2 + (ci - cj) ** 2)
+            if dist_ <= connect_thresh:
                 adj[i, j] = 1.0
                 adj[j, i] = 1.0
 
@@ -95,27 +96,40 @@ def build_eeg_2a_adj(num_channels: int = 22, connect_thresh: float = 1.5, self_l
 # ================== STFT 频带功率特征提取 ==================
 def extract_stft_bandpower(inputs: torch.Tensor) -> torch.Tensor:
     """
-    inputs: (B, 22, 1000)
-    return: (B, 22, N_BANDS, T_frames)
+    inputs: (B, C, T)  —— 例如 BCICIV-2a: (B, 22, 1000)
+    return: (B, C, N_BANDS, T_frames)
     """
     device = inputs.device
-    window = torch.hann_window(WIN, device=device)
+    B, C, T = inputs.shape
+
+    # torch.stft 在部分 PyTorch 版本中只接受 1D/2D 输入；
+    # 这里把 (B, C, T) 展平为 (B*C, T) 再做 STFT。
+    window = torch.hann_window(WIN, device=device, dtype=inputs.dtype)
+    x_2d = inputs.reshape(B * C, T)  # (B*C, T)
 
     X = torch.stft(
-        inputs, n_fft=N_FFT, hop_length=HOP, win_length=WIN,
-        window=window, center=CENTER, return_complex=True
-    )  # (B, 22, Freq, T_frames)
+        x_2d,
+        n_fft=N_FFT,
+        hop_length=HOP,
+        win_length=WIN,
+        window=window,
+        center=CENTER,
+        return_complex=True
+    )  # (B*C, Freq, T_frames)
+
+    # reshape 回 (B, C, Freq, T_frames)
+    X = X.reshape(B, C, X.size(1), X.size(2))
 
     P = (X.abs() ** 2)  # power
-    freqs = torch.fft.rfftfreq(N_FFT, d=1.0/FS).to(device)
+    freqs = torch.fft.rfftfreq(N_FFT, d=1.0 / FS).to(device)
 
     feats = []
     for (f0, f1) in BANDS:
         idx = (freqs >= f0) & (freqs < f1)
-        bp = P[:, :, idx, :].mean(dim=2)  # (B,22,T_frames)
+        bp = P[:, :, idx, :].mean(dim=2)  # (B, C, T_frames)
         feats.append(bp)
 
-    feats = torch.stack(feats, dim=2)  # (B,22,N_BANDS,T_frames)
+    feats = torch.stack(feats, dim=2)  # (B, C, N_BANDS, T_frames)
     feats = torch.log(feats + EPS)
 
     # baseline：减去前 BASE_FRAMES 帧均值（近似 ERD 形式）
@@ -353,11 +367,11 @@ def main():
 
         test_metrics = evaluate_eeg(final_model, test_loader, criterion, device)
 
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print(f"Subject {subject} 最终结果（Session E 测试集，官方协议）")
         print(f"Accuracy : {test_metrics['accuracy']:.4f}")
         print(f"F1(macro): {test_metrics['f1_macro']:.4f}")
-        print("="*60)
+        print("=" * 60)
 
     if is_distributed:
         dist.destroy_process_group()
