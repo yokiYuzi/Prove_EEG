@@ -41,7 +41,7 @@ class ScaledDotProductAttention(nn.Module): # 标准点积注意力（带V和sof
         scores = torch.matmul(Q, K.transpose(-1, -2)) / np.sqrt(self.d_k) + res_att  # 计算分数并加入残差注意力
         if attn_mask is not None: # 应用掩码
             scores.masked_fill_(attn_mask, -1e9) #
-        attn_weights = F.softmax(scores, dim=3) # 计算注意力权重
+        attn_weights = F.softmax(scores, dim=-1) # 计算注意力权重
         context = torch.matmul(attn_weights, V)  # 计算上下文向量
         return context, scores # 返回上下文和原始分数（softmax前，但已加res_att）
 
