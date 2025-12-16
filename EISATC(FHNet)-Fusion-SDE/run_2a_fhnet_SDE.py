@@ -21,7 +21,7 @@ from DSTAGNN_my1 import make_model
 
 # ================== 基础超参数 ==================
 NUM_CHANNELS = 22
-WINDOW_SIZE = 1000                  # 模型输入时间长度
+WINDOW_SIZE = 250                  # 模型输入时间长度
 NUM_CLASSES = 4
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "4"))
 N_EPOCHS = int(os.environ.get("EPOCHS", "200"))   # 原来的 EPOCHS_PER_FOLD 改名更清晰
