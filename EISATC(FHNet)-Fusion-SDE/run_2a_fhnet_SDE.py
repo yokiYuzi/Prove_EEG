@@ -112,7 +112,7 @@ def train_one_epoch_eeg(model, loader, optimizer, criterion, device):
         inputs = inputs.to(device)          # (B, 22, 1000)
         labels = labels.to(device)
 
-        #inputs = prepare_eeg_for_dstagnn(inputs)   # → (B, 22, 250)
+        inputs = prepare_eeg_for_dstagnn(inputs)   # → (B, 22, 250)
         x = inputs.unsqueeze(2)                     # (B, N, 1, T)
 
         optimizer.zero_grad()
