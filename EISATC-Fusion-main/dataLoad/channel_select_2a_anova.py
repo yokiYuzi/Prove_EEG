@@ -5,27 +5,40 @@
 # Output: channel ranking + Top-K selection + CSV/PNG
 # ------------------------------------------------------------
 
+# ---- Windows OpenMP runtime duplicated init workaround (optional but useful) ----
 import os
+if os.name == "nt":
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+# -----------------------------------------------------------------------------
+
 import sys
 import json
 import argparse
 import numpy as np
-
 from sklearn.feature_selection import f_classif
 
 # ---- make sure we can import get_data exactly like your training scripts ----
 CUR_DIR = os.path.abspath(os.path.dirname(__file__))
+
 if CUR_DIR not in sys.path:
     sys.path.append(CUR_DIR)
-DATALOAD_DIR = os.path.join(CUR_DIR, "dataLoad")
-if DATALOAD_DIR not in sys.path and os.path.isdir(DATALOAD_DIR):
-    sys.path.append(DATALOAD_DIR)
+
+# If this script is placed in root, add root/dataLoad to path
+PARENT_DIR = os.path.dirname(CUR_DIR)
+DATALOAD_DIR_1 = os.path.join(CUR_DIR, "dataLoad")
+DATALOAD_DIR_2 = os.path.join(PARENT_DIR, "dataLoad")
+
+for d in [DATALOAD_DIR_1, DATALOAD_DIR_2]:
+    if os.path.isdir(d) and d not in sys.path:
+        sys.path.append(d)
 
 try:
-    # training scripts often use: from dataLoad.preprocess import get_data
+    # training style
     from dataLoad.preprocess import get_data
 except Exception:
-    # plotting scripts in dataLoad folder use: from preprocess import get_data
+    # if script is in dataLoad folder, preprocess.py is in same folder
     from preprocess import get_data
 
 
@@ -36,6 +49,63 @@ CH_NAMES_2A = [
     "CP3", "CP1", "CPz", "CP2", "CP4",
     "P1", "Pz", "P2", "POz",
 ]
+
+
+def _norm_dir(p: str) -> str:
+    """Normalize directory path and ensure it ends with '/' (compatible with your preprocess string concat)."""
+    p = os.path.normpath(p)
+    p = p.replace("\\", "/")
+    if not p.endswith("/"):
+        p += "/"
+    return p
+
+
+def auto_detect_data_dir(user_given: str | None = None) -> str:
+    """
+    Auto detect BCICIV_2a directory when user didn't pass --data_dir.
+    It tries common locations based on where the script is.
+    """
+    if user_given is not None and str(user_given).strip() != "":
+        return _norm_dir(user_given)
+
+    script_dir = os.path.abspath(os.path.dirname(__file__))
+
+    # If script is inside ".../dataLoad", then the dataset is likely under the same folder.
+    candidates = [
+        os.path.join(script_dir, "BCICIV_2a"),
+        os.path.join(script_dir, "BCICIV_2a_mat"),
+        os.path.join(script_dir, "BCICIV_2a_mat", ""),  # harmless
+    ]
+
+    # If script is in project root, dataset is likely under "dataLoad/..."
+    project_root = script_dir
+    if os.path.basename(script_dir).lower() == "dataload":
+        project_root = os.path.dirname(script_dir)
+
+    candidates += [
+        os.path.join(project_root, "dataLoad", "BCICIV_2a"),
+        os.path.join(project_root, "dataLoad", "BCICIV_2a_mat"),
+        os.path.join(project_root, "dataLoad", "BCICIV_2a_mat", ""),
+    ]
+
+    # choose the first candidate that contains s1 folder
+    for c in candidates:
+        c_norm = os.path.normpath(c)
+        if os.path.isdir(c_norm):
+            # expected: .../BCICIV_2a/s1/...
+            if os.path.isdir(os.path.join(c_norm, "s1")) or os.path.isdir(os.path.join(c_norm, "s01")):
+                return _norm_dir(c_norm)
+
+    # If not found, raise a clear error
+    msg = (
+        "无法自动找到 BCICIV_2a 数据目录。\n"
+        "请使用命令行显式指定，例如：\n"
+        "  python channel_select_2a_anova.py --data_dir C:/Prove_EEG/EISATC-Fusion-main/dataLoad/BCICIV_2a/ --subject 1 --k 8 --plot\n\n"
+        "我尝试过的候选路径包括：\n"
+        + "\n".join([f"  - {os.path.normpath(x)}" for x in candidates]) +
+        "\n\n并且期望数据结构形如：BCICIV_2a/s1/A01T.mat 等。"
+    )
+    raise FileNotFoundError(msg)
 
 
 def parse_bands(band_str: str):
@@ -163,7 +233,6 @@ def select_topk_with_corr(
         ok = True
         for s in selected:
             vs = flat_vec(int(s))
-            # handle zero-variance cases
             if np.std(v) < 1e-8 or np.std(vs) < 1e-8:
                 continue
             corr = np.corrcoef(v, vs)[0, 1]
@@ -176,7 +245,6 @@ def select_topk_with_corr(
             selected.append(int(ch))
             selected_set.add(int(ch))
 
-    # fallback fill
     if len(selected) < k:
         for ch in order:
             ch = int(ch)
@@ -226,7 +294,6 @@ def plot_scores_bar(save_path: str, ch_names, scores, topn: int = 22):
 
 def run_one_subject(args, subject: int):
     # 1) Load data (Session T for training, Session E for testing)
-    # IMPORTANT: channel selection uses Session T only to avoid leakage.
     X_train, y_train, X_test, y_test, _, _ = get_data(
         path=args.data_dir,
         subject=subject,
@@ -234,30 +301,23 @@ def run_one_subject(args, subject: int):
         Transfer=False,
         onLine_2a=False,
         data_model="one_session",
-        isStandard=args.is_standard,   # default False for bandpower-based selection
+        isStandard=args.is_standard,
         data_type="2a",
     )
 
     if X_train is None or len(X_train) == 0:
-        raise RuntimeError(f"[S{subject}] X_train is empty. Check --data_dir and subject.")
+        raise RuntimeError(f"[S{subject}] X_train is empty. Check data_dir={args.data_dir}")
     if X_train.ndim != 3:
         raise RuntimeError(f"[S{subject}] X_train shape must be [trial,ch,time], got {X_train.shape}")
 
     y_train = np.asarray(y_train).reshape(-1).astype(int)
     N, C, T = X_train.shape
 
-    # 2) Infer fs from your pipeline:
-    # In preprocess.py, fs=250 and crop 2-6s => 4 seconds => T should be 1000 typically.
-    # We keep it robust:
-    if args.fs is not None:
-        fs = int(args.fs)
-    else:
-        # assume 4-second MI window after crop (2-6s)
-        fs = int(round(T / 4.0))
+    # infer fs (crop window is 4s: 2-6s)
+    fs = int(args.fs) if args.fs is not None else int(round(T / 4.0))
 
     ch_names = get_ch_names(C, "2a")
 
-    # 3) Feature extraction: log bandpower per channel, per window, per band
     bands = parse_bands(args.bands)
     feat = extract_log_bandpower_features(
         X_train.astype(np.float32),
@@ -268,10 +328,8 @@ def run_one_subject(args, subject: int):
         eps=args.eps,
     )  # [N,C,D]
 
-    # 4) ANOVA scoring
-    scores, F_all = channel_scores_anova(feat, y_train)
+    scores, _F_all = channel_scores_anova(feat, y_train)
 
-    # 5) select top-k (+ optional redundancy control)
     if args.corr_thr is not None and args.corr_thr > 0:
         selected_idx = select_topk_with_corr(scores, feat, k=args.k, corr_thr=args.corr_thr)
     else:
@@ -280,7 +338,6 @@ def run_one_subject(args, subject: int):
 
     selected_names = [ch_names[int(i)] for i in selected_idx]
 
-    # 6) Save results
     sub_dir = os.path.join(args.save_dir, f"sub{subject:02d}")
     os.makedirs(sub_dir, exist_ok=True)
 
@@ -306,9 +363,9 @@ def run_one_subject(args, subject: int):
     with open(os.path.join(sub_dir, "selected_channels.json"), "w", encoding="utf-8") as f:
         json.dump(out_json, f, ensure_ascii=False, indent=2)
 
-    # 7) Print summary
     print("=" * 80)
-    print(f"[Subject {subject}] X_train={X_train.shape}, fs≈{fs}Hz, bands={bands}, win_sec={args.win_sec}")
+    print(f"[Subject {subject}] data_dir={args.data_dir}")
+    print(f"X_train={X_train.shape}, fs≈{fs}Hz, bands={bands}, win_sec={args.win_sec}")
     print(f"Top-{args.k} selected channels (idx -> name):")
     for i in selected_idx:
         print(f"  {int(i):2d} -> {ch_names[int(i)]}   (score={scores[int(i)]:.4f})")
@@ -318,8 +375,9 @@ def run_one_subject(args, subject: int):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", type=str, required=True,
-                        help="BCICIV_2a root dir, e.g. /path/to/dataLoad/BCICIV_2a/ (must end with /)")
+    # NOTE: data_dir is no longer required. If not given, we auto-detect.
+    parser.add_argument("--data_dir", type=str, default=None,
+                        help="BCICIV_2a root dir (optional). If not set, auto-detect.")
     parser.add_argument("--subject", type=str, default="1",
                         help="1..9 or 'all'")
     parser.add_argument("--k", type=int, default=8, help="Top-K channels to select")
@@ -340,11 +398,11 @@ def main():
 
     args = parser.parse_args()
 
-    if not args.data_dir.endswith("/") and not args.data_dir.endswith("\\"):
-        # keep consistent with your preprocess path concatenation style
-        args.data_dir = args.data_dir + "/"
+    # auto detect data_dir if not provided
+    args.data_dir = auto_detect_data_dir(args.data_dir)
 
-    if args.subject.lower() == "all":
+    # subject
+    if isinstance(args.subject, str) and args.subject.lower() == "all":
         for s in range(1, 10):
             run_one_subject(args, s)
     else:
