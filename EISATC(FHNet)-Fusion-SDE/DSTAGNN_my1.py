@@ -196,637 +196,736 @@ class SDEParallelFeatureHead(nn.Module):
         seg_node_feats = []
 
         for s in range(max(1, self.num_segments)):
-            t0 = seg_bounds[s]
-            t1 = seg_bounds[s + 1]
+            t0 = seg_bounds[s] if s < len(seg_bounds) - 1 else T
+            t1 = seg_bounds[s + 1] if s + 1 < len(seg_bounds) else T
+
             if t1 <= t0:
-                # 空段：填充零
-                seg_feats = torch.zeros(B, N, 9, device=device, dtype=dtype)
+                # 空段：填零，确保维度不变
+                zeros = torch.zeros(B, N, device=device, dtype=dtype)
+                seg_node_feats.append(torch.stack(
+                    [zeros, zeros, zeros, zeros, zeros, zeros, zeros, zeros, zeros],
+                    dim=-1
+                ))  # (B,N,9)
+                continue
+
+            # --- entropy stats ---
+            ent_seg = ent_all[:, t0:t1, :]  # (B,Ts,N)
+            Ts = ent_seg.size(1)
+
+            ent_mean = ent_seg.mean(dim=1)
+            ent_std = ent_seg.std(dim=1, unbiased=False) if Ts > 1 else torch.zeros(B, N, device=device, dtype=dtype)
+            ent_range = ent_seg.max(dim=1).values - ent_seg.min(dim=1).values
+            if Ts > 1:
+                ent_slope = (ent_seg[:, -1, :] - ent_seg[:, 0, :]) / max(1, Ts - 1)
             else:
-                ent = ent_all[:, t0:t1]    # (B, t_seg, N)
-                diag = diag_all[:, t0:t1]  # (B, t_seg, N)
+                ent_slope = torch.zeros(B, N, device=device, dtype=dtype)
 
-                # 1. 熵统计：mean, std, range, slope
-                ent_mean = ent.mean(dim=1)  # (B,N)
-                ent_std = ent.std(dim=1, unbiased=False)
-                ent_range = ent.max(dim=1).values - ent.min(dim=1).values
-                ent_slope = (ent[:, -1] - ent[:, 0]) / max(1, t1 - t0 - 1) if t1 - t0 > 1 else torch.zeros_like(ent_mean)
+            # --- distribution change stats (abs diff) ---
+            P_seg = P[:, t0:t1, :, :, :]  # (B,Ts,H,N,N)
+            if Ts > 1:
+                diff = (P_seg[:, 1:] - P_seg[:, :-1]).abs().sum(dim=-1)  # (B,Ts-1,H,N)
+                diff = diff.mean(dim=2)                                   # (B,Ts-1,N)
+                var_mean = diff.mean(dim=1)
+                var_std = diff.std(dim=1, unbiased=False) if diff.size(1) > 1 else torch.zeros(B, N, device=device, dtype=dtype)
+                var_max = diff.max(dim=1).values
+            else:
+                var_mean = torch.zeros(B, N, device=device, dtype=dtype)
+                var_std = torch.zeros(B, N, device=device, dtype=dtype)
+                var_max = torch.zeros(B, N, device=device, dtype=dtype)
 
-                # 2. 分布变化率 ΔA_t(n) = sum_j |P_t(n,j) - P_{t-1}(n,j)|
-                # 注意：计算 t>=1 的变化，忽略 t=0
-                if t1 - t0 > 1:
-                    P_seg = P.mean(dim=2)[:, t0:t1]  # (B, t_seg, N, N)
-                    dP_seg = P_seg[:, 1:] - P_seg[:, :-1]  # (B, t_seg-1, N, N)
-                    abs_dP = dP_seg.abs().sum(dim=-1)  # (B, t_seg-1, N) ΔA_t(n)
-                    dp_mean = abs_dP.mean(dim=1)
-                    dp_std = abs_dP.std(dim=1, unbiased=False)
-                    dp_max = abs_dP.max(dim=1).values
-                else:
-                    dp_mean = dp_std = dp_max = torch.zeros(B, N, device=device, dtype=dtype)
+            # --- diag stats ---
+            diag_seg = diag_all[:, t0:t1, :]  # (B,Ts,N)
+            diag_mean = diag_seg.mean(dim=1)
+            diag_std = diag_seg.std(dim=1, unbiased=False) if Ts > 1 else torch.zeros(B, N, device=device, dtype=dtype)
 
-                # 3. 自环统计：mean, std
-                diag_mean = diag.mean(dim=1)
-                diag_std = diag.std(dim=1, unbiased=False)
+            feat_seg = torch.stack(
+                [ent_mean, ent_std, ent_range, ent_slope,
+                 var_mean, var_std, var_max,
+                 diag_mean, diag_std],
+                dim=-1
+            )  # (B,N,9)
+            seg_node_feats.append(feat_seg)
 
-                seg_feats = torch.stack([
-                    ent_mean, ent_std, ent_range, ent_slope,
-                    dp_mean, dp_std, dp_max,
-                    diag_mean, diag_std
-                ], dim=-1)  # (B,N,9)
+        feat_nodes = torch.cat(seg_node_feats, dim=-1)  # (B,N,9*num_segments)
+        feat_nodes_flat = feat_nodes.reshape(B, -1)     # (B, N*9*num_segments)
 
-            seg_node_feats.append(seg_feats)
+        # ===== 2) 边级 Top-K 动态增强/减弱（全局时间统计，带方向）=====
+        # P_edge: (B,T,N,N) —— head 平均
+        P_edge = P.mean(dim=2)
 
-        node_feats = torch.cat(seg_node_feats, dim=-1)  # (B,N,9*S) S=num_segments
-        node_feats = node_feats.view(B, -1)  # (B, N*9*S)
-
-        # ===== 2) 边级 TopK 统计：(B, topK*4) =====
-        P_edge = P.mean(dim=2)  # (B,T,N,N)
+        if T > 0:
+            P_edge_mean = P_edge.mean(dim=1)  # (B,N,N)
+        else:
+            P_edge_mean = torch.zeros(B, N, N, device=device, dtype=dtype)
 
         if T > 1:
-            dP = P_edge[:, 1:] - P_edge[:, :-1]  # (B,T-1,N,N)
-            abs_mean_dP = dP.abs().mean(dim=1)  # (B,N,N) |mean_t(dP)|
-            if self.exclude_self_edges:
-                abs_mean_dP.diagonal().fill_(0.0)  # 排除自环
-
-            flat_abs_mean = abs_mean_dP.view(B, -1)  # (B,N*N)
-            topk_vals, topk_idx_flat = flat_abs_mean.topk(self.topk_edges, dim=-1, sorted=False)
-            topk_i = topk_idx_flat // N
-            topk_j = topk_idx_flat % N
-            topk_mask = torch.zeros(B, N, N, device=device, dtype=torch.bool)
-            topk_mask.scatter_(dim=-1, index=topk_j.unsqueeze(-1), src=torch.ones_like(topk_j.unsqueeze(-1), dtype=torch.bool))
-            topk_mask = topk_mask.scatter_(dim=-2, index=topk_i.unsqueeze(-1), src=topk_mask.any(dim=-1, keepdim=True))  # 实际只需设置 (i,j)=1
-
-            # 对每条 topk 边计算 4 维特征
-            P_topk = P_edge * topk_mask.unsqueeze(1)  # (B,T,N,N)
-            dP_topk = dP * topk_mask.unsqueeze(1)[:, :T-1] if T > 1 else torch.zeros_like(P_topk[:, :1])
-
-            mean_P = P_topk.mean(dim=1).view(B, -1)[:, topk_idx_flat[0]]  # 示例：取第一个 batch 的 idx，但实际需 per-batch
-            # 修正：需逐 batch 计算
-            edge_feats = []
-            for b in range(B):
-                sel_idx = topk_idx_flat[b]
-                mean_P_b = P_edge[b].mean(dim=0).view(-1)[sel_idx]
-                std_dP_b = dP[b].std(dim=0, unbiased=False).view(-1)[sel_idx]
-                mean_dP_b = dP[b].mean(dim=0).view(-1)[sel_idx]
-                pos_trend = F.relu(mean_dP_b)
-                neg_trend = F.relu(-mean_dP_b)
-                feats_b = torch.stack([mean_P_b, std_dP_b, pos_trend, neg_trend], dim=-1)  # (K,4)
-                edge_feats.append(feats_b.view(-1))  # (K*4,)
-
-            edge_feats = torch.stack(edge_feats, dim=0)  # (B, K*4)
+            dP = P_edge[:, 1:] - P_edge[:, :-1]           # (B,T-1,N,N)
+            dP_mean = dP.mean(dim=1)                      # (B,N,N)
+            dP_pos = F.relu(dP_mean)                      # (B,N,N)
+            dP_neg = F.relu(-dP_mean)                     # (B,N,N)
+            dP_std = dP.std(dim=1, unbiased=False)        # (B,N,N)
         else:
-            edge_feats = torch.zeros(B, max(1, self.topk_edges) * 4, device=device, dtype=dtype)
+            dP_mean = torch.zeros(B, N, N, device=device, dtype=dtype)
+            dP_pos = torch.zeros(B, N, N, device=device, dtype=dtype)
+            dP_neg = torch.zeros(B, N, N, device=device, dtype=dtype)
+            dP_std = torch.zeros(B, N, N, device=device, dtype=dtype)
 
-        # 3. 拼接 & 投影
-        all_feats = torch.cat([node_feats, edge_feats], dim=-1)
-        return self.proj(all_feats)
+        edge_feat_all = torch.stack([P_edge_mean, dP_std, dP_pos, dP_neg], dim=-1)  # (B,N,N,4)
+        edge_flat = edge_feat_all.reshape(B, N * N, 4)                              # (B,N^2,4)
+        score_abs = dP_mean.abs().reshape(B, N * N)                                 # (B,N^2)
+
+        if self.exclude_self_edges and N > 1:
+            eye = torch.eye(N, device=device, dtype=torch.bool).reshape(N * N)
+            score_abs = score_abs.masked_fill(eye.unsqueeze(0), float("-inf"))
+
+        topk = min(max(1, self.topk_edges), N * N)
+        _, idx = torch.topk(score_abs, k=topk, dim=-1)                              # (B,topk)
+        idx_exp = idx.unsqueeze(-1).expand(-1, -1, 4)                               # (B,topk,4)
+        topk_edges_feat = torch.gather(edge_flat, dim=1, index=idx_exp)             # (B,topk,4)
+        feat_edges = topk_edges_feat.reshape(B, topk * 4)                           # (B,topk*4)
+
+        # 如果 topk < self.topk_edges（例如 N 很小），补零到固定 edge_dim
+        target_edge_dim = max(1, self.topk_edges) * 4
+        if feat_edges.size(1) < target_edge_dim:
+            pad = torch.zeros(B, target_edge_dim - feat_edges.size(1), device=device, dtype=dtype)
+            feat_edges = torch.cat([feat_edges, pad], dim=1)
+        elif feat_edges.size(1) > target_edge_dim:
+            feat_edges = feat_edges[:, :target_edge_dim]
+
+        # ===== 3) 拼接并投影 =====
+        feat_all = torch.cat([feat_nodes_flat, feat_edges], dim=1)
+        emb = self.proj(feat_all)
+        return emb
 
 
+# ========== [新增] 时间序列特征导出器 ==========
 class TemporalSeqExporter(nn.Module):
     """
-    从 DSTAGNN_block 的内部状态中提取时间序列特征，用于可解释性分析和分类消融实验。
-    1. tat_only: 从 TAt 注意力分数中提取节点级的时间序列 (B,N,T)
-    2. gtu_only: 从 GTU 门权重中提取节点级的时间序列 (B,N,T)
-    3. mixed:    上述两种的混合 (alpha 融合)
+    提供三类时间序列:
+        1) TAt-only: 基于 tat_scores 构造的时间注意力中心度序列  (B, N, T)
+        2) GTU-only: 基于 gate3/5/7 的门控强度序列，Upsample 对齐到 T 并多尺度汇总 (B, N, T)
+        3) Mixed:    规范化后加权融合 / 拼接序列 (B, N, T) 或 (B, N, T, 4)
     """
-    def __init__(self, method_norm: str = "zscore", upsample_mode: str = "linear"):
+    def __init__(self, method_norm="zscore", upsample_mode="linear"):
         super().__init__()
-        self.method_norm = method_norm.lower()
-        self.upsample_mode = upsample_mode.lower()
-        assert self.method_norm in ["zscore", "minmax"], "method_norm 必须是 'zscore' 或 'minmax'。"
-        assert self.upsample_mode in ["nearest", "linear"], "upsample_mode 必须是 'nearest' 或 'linear'。"
-
+        self.method_norm = method_norm
+        self.upsample_mode = upsample_mode
+    
     @staticmethod
-    def _safe_softmax_last(scores: torch.Tensor) -> torch.Tensor:
+    def _safe_softmax_last(scores):
+        # scores: (B, F, H, T, T)
         return F.softmax(scores, dim=-1)
-
+    
     @staticmethod
-    def _zscore(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
+    def _zscore(x, dim=-1, eps=1e-6):
         m = x.mean(dim=dim, keepdim=True)
         s = x.std(dim=dim, keepdim=True, unbiased=False).clamp_min(eps)
         return (x - m) / s
 
-    @staticmethod
-    def _minmax(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
-        mn = x.min(dim=dim, keepdim=True).values
-        mx = x.max(dim=dim, keepdim=True).values
-        return (x - mn) / (mx - mn + eps)
-
-    def tat_only(self, tat_scores: torch.Tensor, TATout: torch.Tensor) -> torch.Tensor:
-        # tat_scores: (B, F, H, T, T)
-        # TATout:     (B, F, T, N)
-        B, F, H, T, _ = tat_scores.shape
-        A = self._safe_softmax_last(tat_scores)            # (B,F,H,T,T)
-        inflow = A.sum(dim=3)                              # (B,F,H,T) 入流和（每时刻每个头）
-        inflow = inflow.mean(dim=(1,2)) / T                # (B,T) 平均入流强度（跨特征/头）
-        c = inflow.view(B, 1, T, 1)                        # (B,1,T,1)
-        node_seq = (TATout * c).mean(dim=1).transpose(2,1)  # (B,F,T,N) * (B,1,T,1) -> mean_F -> (B,N,T)
+    def tat_only(self, tat_scores, TATout):
+        """
+        输入:
+          tat_scores: (B, F, H, T, T)  —— TAt 的打分（未softmax或已加残差）
+          TATout    : (B, F, T, N)    —— TAt 输出（含节点维N）
+        输出:
+          attn_centrality_per_node: (B, N, T)
+        解释:
+          1) 先对 scores 做 softmax(最后一维, key维)，得到 A[b,f,h,t,q] = attention(q <- t)
+          2) 按 (f,h) 平均后，得到每个 (query时刻 q) 的“全局中心度” c[q] = Σ_t A[:, :, :, t, q] / (F*H*T)
+          3) 利用 TATout 提供的节点维 N，把 c[q] 作为权重对 (B,F,T,N) 做 time-wise 加权，得到节点级时间序列:
+               s_node[n, q] = Σ_f TATout[b,f,q,n] * c[b,q]
+        """
+        B, F_ch, H, T, _ = tat_scores.shape
+        A = self._safe_softmax_last(tat_scores)              # (B,F,H,T,T)
+        inflow = A.sum(dim=3)                                # Σ_t A[t->q], shape: (B,F,H,T)
+        inflow = inflow.mean(dim=(1,2)) / T                  # (B,T), 归一化为中心度 c[q]
+        # 扩展为 (B,1,T,1) 便于广播到 TATout:(B,F,T,N) 上
+        c = inflow.view(B, 1, T, 1)
+        node_seq = (TATout * c).mean(dim=1).transpose(2,1)   # (B,N,T)
         return node_seq
 
-    def _upsample_to_T(self, x: torch.Tensor, T: int) -> torch.Tensor:
+    def _upsample_to_T(self, x, T):
+        # x: (B, F, N, t_small) 或 (B, 1, N, t_small)
         B, Fch, N, t_small = x.shape
         if t_small == T:
             return x
-        x_ = x.reshape(B * Fch * N, 1, t_small)
-        x_up = F.interpolate(x_, size=T, mode=self.upsample_mode,
-                             align_corners=False if self.upsample_mode == 'linear' else None)
+        # 使用线性上采样到 T（对每个(B,F,N)做1D插值）
+        x_ = x.reshape(B*Fch*N, 1, t_small)
+        x_up = F.interpolate(x_, size=T, mode=self.upsample_mode, align_corners=False if self.upsample_mode=='linear' else None)
         return x_up.reshape(B, Fch, N, T)
 
-    def gtu_only(self, gate3: torch.Tensor, gate5: torch.Tensor, gate7: torch.Tensor, T: int) -> torch.Tensor:
-        # gate*: (B, Fch, N, T*)
-        g3 = self._upsample_to_T(gate3, T).mean(dim=1)  # (B,N,T)
+    def gtu_only(self, gate3, gate5, gate7, T):
+        """
+        gate*: (B, F, N, T_k)  —— GTU 的 Sigmoid 门控权重（越大表示激活越强）
+        输出:
+          gtu_ms_seq: (B, N, T) —— 先各尺度上采样到 T，再做多尺度融合(平均或加权)
+        """
+        # 上采样到 T
+        g3 = self._upsample_to_T(gate3, T).mean(dim=1)   # (B,N,T)
         g5 = self._upsample_to_T(gate5, T).mean(dim=1)
         g7 = self._upsample_to_T(gate7, T).mean(dim=1)
-        gtu_ms = torch.stack([g3, g5, g7], dim=1).mean(dim=1)  # (B,N,T) 多尺度平均
+        gtu_ms = torch.stack([g3, g5, g7], dim=1).mean(dim=1)   # (B,N,T) 多尺度平均
         return gtu_ms
 
-    def mixed(self, tat_seq_node: torch.Tensor, gtu_ms_seq: torch.Tensor, alpha: float = 0.5) -> torch.Tensor:
-        assert 0.0 <= alpha <= 1.0, "alpha 必须在 [0,1] 之间。"
+    def mixed(self, tat_seq_node, gtu_ms_seq, alpha=0.5):
+        """
+        将两类序列在同一时间轴 T 上融合：
+          - 先各自 z-score（或 min-max）规范化
+          - 再做凸组合: mixed = α * tat + (1-α) * gtu
+        """
         if self.method_norm == "zscore":
             tat_n = self._zscore(tat_seq_node, dim=-1)
             gtu_n = self._zscore(gtu_ms_seq, dim=-1)
-        else:  # "minmax"
-            tat_n = self._minmax(tat_seq_node, dim=-1)
-            gtu_n = self._minmax(gtu_ms_seq, dim=-1)
+        else:
+            # min-max 规范化
+            def mm(x, eps=1e-6): 
+                mn, mx = x.min(dim=-1, keepdim=True).values, x.max(dim=-1, keepdim=True).values
+                return (x - mn) / (mx - mn + eps)
+            tat_n, gtu_n = mm(tat_seq_node), mm(gtu_ms_seq)
         return alpha * tat_n + (1 - alpha) * gtu_n
 
 
 class MultiHeadAttention(nn.Module): # 时间多头注意力模块
-    def __init__(self, DEVICE, d_model_nodes, d_k, d_v, n_heads, num_of_d_features): # 初始化
+    def __init__(self, DEVICE, d_model_nodes, d_k ,d_v, n_heads, num_of_d_features): # 初始化
         super(MultiHeadAttention, self).__init__() #
-        self.d_model_nodes = d_model_nodes #
+        self.d_model_nodes = d_model_nodes # 节点维度 (N)
         self.d_k = d_k #
         self.d_v = d_v #
         self.n_heads = n_heads #
-        self.num_of_d_features = num_of_d_features #
-        self.W_Q = nn.Linear(d_model_nodes, d_k * n_heads, bias=False) # Q投影
-        self.W_K = nn.Linear(d_model_nodes, d_k * n_heads, bias=False) # K投影
-        self.W_V = nn.Linear(d_model_nodes, d_v * n_heads, bias=False) # V投影
-        self.fc = nn.Linear(n_heads * d_v, d_model_nodes, bias=False) # 最终线性层
-        self.layer_norm = nn.LayerNorm(d_model_nodes).to(DEVICE) # 层归一化
+        self.num_of_d_features = num_of_d_features # 特征维度 (F)
+        self.W_Q = nn.Linear(d_model_nodes, d_k * n_heads, bias=False) #
+        self.W_K = nn.Linear(d_model_nodes, d_k * n_heads, bias=False) #
+        self.W_V = nn.Linear(d_model_nodes, d_v * n_heads, bias=False) #
+        self.fc = nn.Linear(n_heads * d_v, d_model_nodes, bias=False) #
+        self.layer_norm = nn.LayerNorm(d_model_nodes).to(DEVICE) #
 
     def forward(self, input_Q, input_K, input_V, attn_mask, res_att): # 前向传播
         residual, batch_size = input_Q, input_Q.size(0) #
-        Q = self.W_Q(input_Q).view(batch_size, self.num_of_d_features, -1,
-                                   self.n_heads, self.d_k).transpose(2, 3)  # (B, F, T, H, d_k) -> (B, F, H, T, d_k)
-        K = self.W_K(input_K).view(batch_size, self.num_of_d_features, -1,
-                                   self.n_heads, self.d_k).transpose(2, 3)  #
-        V = self.W_V(input_V).view(batch_size, self.num_of_d_features, -1,
-                                   self.n_heads, self.d_v).transpose(2, 3)  #
+        
+        Q = self.W_Q(input_Q).view(batch_size, self.num_of_d_features, -1, self.n_heads, self.d_k).transpose(2, 3)
+        K = self.W_K(input_K).view(batch_size, self.num_of_d_features, -1, self.n_heads, self.d_k).transpose(2, 3)
+        V = self.W_V(input_V).view(batch_size, self.num_of_d_features, -1, self.n_heads, self.d_v).transpose(2, 3)
 
-        context, res_attn_scores = ScaledDotProductAttention(
-            self.d_k, self.num_of_d_features)(Q, K, V, attn_mask, res_att)  # (B, F, H, T, d_v), (B, F, H, T, T)
+        context, res_attn_scores = ScaledDotProductAttention(self.d_k, self.num_of_d_features)(Q, K, V, attn_mask, res_att) #
 
-        context = context.transpose(2, 3).reshape(
-            batch_size, self.num_of_d_features, -1, self.n_heads * self.d_v)  # (B, F, T, H*d_v)
-        output = self.fc(context) # (B, F, T, d_model_nodes)
+        context = context.transpose(2, 3).reshape(batch_size, self.num_of_d_features, -1, self.n_heads * self.d_v) #
+        output = self.fc(context)  #
 
         return self.layer_norm(output + residual), res_attn_scores #
 
 
-class cheb_conv_withSAt(nn.Module): # 带静态/动态空间注意力的 ChebConv 模块
-    def __init__(self, K_cheb, cheb_polynomials, in_channels, out_channels, num_of_vertices,
-                 dynamic_attn_alpha: float = 0.5): # 初始化
-        super(cheb_conv_withSAt, self).__init__() #
-        self.K_cheb = K_cheb #
-        self.in_channels = in_channels #
-        self.out_channels = out_channels #
-        self.dynamic_attn_alpha = dynamic_attn_alpha  # 动态注意力混入权重
-        self.relu = nn.ReLU(inplace=True) #
-        self.Theta = nn.ParameterList(
-            [nn.Parameter(torch.empty(in_channels, out_channels))
-             for _ in range(K_cheb)]
-        ) # Cheb 多项式系数
-        self.mask_per_k = nn.ParameterList(
-            [nn.Parameter(torch.empty(num_of_vertices, num_of_vertices))
-             for _ in range(K_cheb)]
-        ) # 每个 k 的邻接掩码
+class cheb_conv_withSAt(nn.Module): # 带空间注意力的切比雪夫图卷积
+    def __init__(self, K_cheb, cheb_polynomials, in_channels, out_channels, num_of_vertices): # 初始化
+        super(cheb_conv_withSAt, self).__init__()
+        self.K_cheb = K_cheb
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        # ✅ [修改] 注册切比雪夫多项式为 buffers
+        # 这样做可以确保在 .to(device) 调用时，这些张量能被正确移动到相应设备
+        self.cheb_T_names = []
+        for k in range(K_cheb):
+            name = f"cheb_T_{k}"
+            self.register_buffer(name, cheb_polynomials[k])
+            self.cheb_T_names.append(name)
 
-        for mask_param in self.mask_per_k: #
-            nn.init.xavier_uniform_(mask_param) #
-        for theta in self.Theta: #
-            nn.init.xavier_uniform_(theta) #
+        self.relu = nn.ReLU(inplace=True)
+        # ✅ [修改] 使用 torch.empty 初始化参数，不指定 device，让PyTorch框架处理设备分配
+        self.Theta = nn.ParameterList([nn.Parameter(torch.empty(in_channels, out_channels)) for _ in range(K_cheb)])
+        self.mask_per_k = nn.ParameterList([nn.Parameter(torch.empty(num_of_vertices, num_of_vertices)) for _ in range(K_cheb)])
 
-    def forward(self, x, spatial_attention_scores, adj_pa_static, sat_scores_seq): # 前向传播
-        batch_size, num_of_vertices, _, num_of_timesteps = x.shape #
-        outputs = [] #
+        # 初始化参数
+        for mask_param in self.mask_per_k:
+            nn.init.xavier_uniform_(mask_param)
+        # ✅ [新增] 初始化 Theta 参数
+        for theta in self.Theta:
+            nn.init.xavier_uniform_(theta)
 
-        # 动态注意力序列 (B,T,H,N,N) -> 时间平均 (B,H,N,N)
-        if sat_scores_seq is not None: #
-            sat_mean_time = sat_scores_seq.mean(dim=1)  # (B,H,N,N)
+    def forward(self, x, spatial_attention_scores, adj_pa_static):
+        batch_size, num_of_vertices, _, num_of_timesteps = x.shape
+        outputs = []
 
-        for t in range(num_of_timesteps): #
-            graph_signal_at_ts = x[:, :, :, t]  # (B, N, in_channels)
-            out_ts = torch.zeros(batch_size, num_of_vertices,
-                                 self.out_channels, device=x.device) #
-            for k in range(self.K_cheb): #
-                T_k = self.cheb_polynomials[k]  # 注意：cheb_polynomials 已在父模块注册为 buffer
-                current_SAt_head_scores = spatial_attention_scores[:, k, :, :]  # (B, N, N)
-                current_mask = self.mask_per_k[k]  # (N, N)
-                dynamic_adj = adj_pa_static.mul(current_mask)  # (N, N)
-                combined_static = current_SAt_head_scores + dynamic_adj.unsqueeze(0)  # (B, N, N)
+        for time_step in range(num_of_timesteps):
+            graph_signal_at_ts = x[:, :, :, time_step]
+            # ✅ [修改] 在输入张量 x 所在的设备上创建新张量，确保设备一致性
+            output_for_ts = torch.zeros(batch_size, num_of_vertices, self.out_channels, device=x.device)
 
-                # 混入动态注意力 (可选)
-                if sat_scores_seq is not None: #
-                    current_dyn_attn = sat_mean_time[:, k, :, :]  # (B, N, N)
-                    combined = (1 - self.dynamic_attn_alpha) * combined_static + \
-                               self.dynamic_attn_alpha * current_dyn_attn  # (B, N, N)
-                else: #
-                    combined = combined_static #
+            for k_order in range(self.K_cheb):
+                # ✅ [修改] 通过 getattr 从 buffer 中获取切比雪夫多项式
+                T_k_laplacian = getattr(self, self.cheb_T_names[k_order])
+                current_SAt_head_scores = spatial_attention_scores[:, k_order, :, :]
+                current_learnable_mask = self.mask_per_k[k_order]
+                dynamic_adj_component = adj_pa_static.mul(current_learnable_mask)
+                combined_spatial_factors = current_SAt_head_scores + dynamic_adj_component.unsqueeze(0)
+                normalized_spatial_factors = F.softmax(combined_spatial_factors, dim=2)
+                T_k_eff_laplacian = T_k_laplacian.unsqueeze(0) * normalized_spatial_factors
+                theta_k_weights = self.Theta[k_order]
+                rhs = torch.bmm(T_k_eff_laplacian, graph_signal_at_ts)
+                output_for_ts = output_for_ts + rhs.matmul(theta_k_weights)
+            outputs.append(output_for_ts.unsqueeze(-1))
 
-                norm_factors = F.softmax(combined, dim=2)  # (B, N, N)
-                T_k_eff = T_k.unsqueeze(0) * norm_factors  # (B, N, N)
-                theta_k = self.Theta[k] #
-                rhs = torch.bmm(T_k_eff, graph_signal_at_ts)  # (B, N, in_channels)
-                out_ts = out_ts + rhs.matmul(theta_k)  # (B, N, out_channels)
-            outputs.append(out_ts.unsqueeze(-1))  # (B, N, out_channels, 1)
-
-        return self.relu(torch.cat(outputs, dim=-1))  # (B, N, out_channels, T)
+        return self.relu(torch.cat(outputs, dim=-1))
 
 
-class Embedding(nn.Module): # 位置编码模块
+class Embedding(nn.Module): # 位置编码嵌入层
     def __init__(self, nb_seq_len, d_embedding_dim, num_of_context_dims_unused, Etype): # 初始化
         super(Embedding, self).__init__() #
         self.nb_seq_len = nb_seq_len #
         self.d_embedding_dim = d_embedding_dim #
         self.Etype = Etype #
-        self.pos_embed = nn.Embedding(nb_seq_len, d_embedding_dim) # 位置嵌入
-        self.norm = nn.LayerNorm(d_embedding_dim) # 层归一化
+        self.pos_embed = nn.Embedding(nb_seq_len, d_embedding_dim) #
+        self.norm = nn.LayerNorm(d_embedding_dim) #
 
     def forward(self, x, batch_size_unused): # 前向传播
-        if self.Etype == 'T': # 时间编码
+        if self.Etype == 'T': #
             pos_indices = torch.arange(self.nb_seq_len, dtype=torch.long, device=x.device) #
             embedding_values = self.pos_embed(pos_indices) #
-            x_permuted = x.permute(0, 2, 3, 1)  # (B, N, F, T) -> (B, N, T, F)
+            x_permuted = x.permute(0, 2, 3, 1) #
             embedding_sum = x_permuted + embedding_values.unsqueeze(0).unsqueeze(0) #
-        else: # 空间编码
+        else: #
             pos_indices = torch.arange(self.nb_seq_len, dtype=torch.long, device=x.device) #
             embedding_values = self.pos_embed(pos_indices) #
-            embedding_sum = x + embedding_values.unsqueeze(0) #
-        embedded_x = self.norm(embedding_sum) #
+            # ✅ 兼容 3D/4D 的空间位置编码。
+            # 典型输入:
+            #   - (B, N, D)       -> 直接加 (1, N, D)
+            #   - (B, N, D, T)    -> 加 (1, N, D, 1)，对 T 广播
+            #   - (B, N, T, D)    -> 加 (1, N, 1, D)，对 T 广播
+            if x.dim() == 3:
+                # (B, N, D)
+                embedding_sum = x + embedding_values.unsqueeze(0)
+                embedded_x = self.norm(embedding_sum)
+
+            elif x.dim() == 4:
+                # (B, N, D, T)
+                if x.size(1) == self.nb_seq_len and x.size(2) == self.d_embedding_dim:
+                    embedding_sum = x + embedding_values.unsqueeze(0).unsqueeze(-1)  # (B,N,D,T)
+                    # LayerNorm 只能作用在最后一维，这里把 D 维挪到最后再归一化
+                    embedded_x = self.norm(embedding_sum.permute(0, 1, 3, 2)).permute(0, 1, 3, 2)
+
+                # (B, N, T, D)
+                elif x.size(1) == self.nb_seq_len and x.size(-1) == self.d_embedding_dim:
+                    embedding_sum = x + embedding_values.unsqueeze(0).unsqueeze(2)  # (B,N,T,D)
+                    embedded_x = self.norm(embedding_sum)
+
+                else:
+                    raise RuntimeError(
+                        f"[Embedding-S] shape mismatch: x={tuple(x.shape)}, "
+                        f"nb_seq_len={self.nb_seq_len}, d_embedding_dim={self.d_embedding_dim}. "
+                        "Expected (B,N,D) or (B,N,D,T) or (B,N,T,D)."
+                    )
+            else:
+                raise RuntimeError(
+                    f"[Embedding-S] unsupported x.dim={x.dim()} for x={tuple(x.shape)}"
+                )
+
+        if self.Etype == 'T':
+            embedded_x = self.norm(embedding_sum)
+
         return embedded_x #
 
 
-class GTU(nn.Module): # 门控时间卷积单元
+class GTU(nn.Module): # 门控时间单元
     def __init__(self, in_channels, time_strides, kernel_size): # 初始化
         super(GTU, self).__init__() #
         self.in_channels = in_channels #
-        self.tanh_act = nn.Tanh() #
-        self.sigmoid_gate = nn.Sigmoid() #
-        self.conv2out = nn.Conv2d(
-            in_channels, 2 * in_channels,
-            kernel_size=(1, kernel_size),
-            stride=(1, time_strides),
-            padding=(0, 0)
-        ) # 因果卷积
+        self.tanh_act = nn.Tanh() # 修改变量名以区分
+        self.sigmoid_gate = nn.Sigmoid() # 修改变量名
+        self.conv2out = nn.Conv2d(in_channels, 2 * in_channels, kernel_size=(1, kernel_size), stride=(1, time_strides), padding=(0,0)) #
 
-    def forward(self, x): # 前向传播
-        x_causal_conv = self.conv2out(x)  # (B, 2*in, N, T_out)
-        x_p = x_causal_conv[:, : self.in_channels, :, :]  # 值分支
-        x_q = x_causal_conv[:, -self.in_channels:, :, :]  # 门分支
-        x_gtu = self.tanh_act(x_p) * self.sigmoid_gate(x_q) #
-        return x_gtu #
+    def forward(self, x): # x: (B, F_in, N, T_in) #
+        x_causal_conv = self.conv2out(x) #
+        x_p = x_causal_conv[:, : self.in_channels, :, :] # 用于tanh的部分
+        x_q = x_causal_conv[:, -self.in_channels:, :, :] # 用于sigmoid门的部分
+        
+        activated_sigmoid_gate = self.sigmoid_gate(x_q) # 计算门控权重
+        x_gtu = torch.mul(self.tanh_act(x_p), activated_sigmoid_gate) # 应用门控
+        return x_gtu, activated_sigmoid_gate # <<< 返回门控权重和GTU输出
 
 
-class GTU_with_gate_weights(nn.Module): # 带门权重记录的 GTU
-    def __init__(self, in_channels, time_strides, kernel_size): # 初始化
-        super(GTU_with_gate_weights, self).__init__() #
-        self.gtu = GTU(in_channels, time_strides, kernel_size) #
+class DSTAGNN_block(nn.Module): # DSTAGNN的核心块
+    def __init__(self, DEVICE, num_of_d_features_for_embedT, in_channels_for_cheb, K_cheb,
+                 nb_chev_filter, nb_time_filter_for_gtu_unused, 
+                 time_strides_for_gtu_and_res,
+                 cheb_polynomials, adj_pa_static, adj_TMD_static_unused, 
+                 num_of_vertices, num_of_timesteps_input,
+                 d_model_for_spatial_attn, d_k_for_attn, d_v_for_attn, n_heads_for_attn,
+                 use_dynamic_spatial_for_gcn: bool = True, dynamic_spatial_alpha: float = 0.5):
+        super(DSTAGNN_block, self).__init__()
 
-    def forward(self, x): # 前向传播
-        x_gtu = self.gtu(x) #
-        gate_weights = x_gtu.mean(dim=0, keepdim=True)  # 示例：实际应从 sigmoid_gate 提取，但这里简化
-        return x_gtu, gate_weights # 返回输出和门权重（用于解释）
+        self.DEVICE = DEVICE
+        self.relu = nn.ReLU(inplace=True)
+        # ✅ [修改] 注册静态邻接矩阵为 buffer
+        self.register_buffer('adj_pa_static', torch.as_tensor(adj_pa_static, dtype=torch.float32))
+
+        # === [新增] 动态空间注意力是否注入 GCN（默认开启，可在构建模型时关闭） ===
+        self.use_dynamic_spatial_for_gcn = bool(use_dynamic_spatial_for_gcn)
+        self.dynamic_spatial_alpha = float(dynamic_spatial_alpha)
+        if self.dynamic_spatial_alpha < 0.0:
+            self.dynamic_spatial_alpha = 0.0
+        elif self.dynamic_spatial_alpha > 1.0:
+            self.dynamic_spatial_alpha = 1.0
+
+        self.EmbedT = Embedding(num_of_timesteps_input, num_of_vertices, num_of_d_features_for_embedT, 'T')
+        self.TAt = MultiHeadAttention(DEVICE, num_of_vertices, d_k_for_attn, d_v_for_attn, n_heads_for_attn, num_of_d_features_for_embedT)
+        self.tat_output_proj = nn.Linear(num_of_d_features_for_embedT * num_of_timesteps_input, d_model_for_spatial_attn)
+
+        self.EmbedS = Embedding(num_of_vertices, d_model_for_spatial_attn, d_model_for_spatial_attn, 'S')
+        self.SAt = SMultiHeadAttention(DEVICE, d_model_for_spatial_attn, d_k_for_attn, d_v_for_attn, K_cheb)
+
+        self.cheb_conv_SAt = cheb_conv_withSAt(K_cheb, cheb_polynomials, in_channels_for_cheb, nb_chev_filter, num_of_vertices)
+
+        self.gtu3 = GTU(nb_chev_filter, time_strides_for_gtu_and_res, 3)
+        self.gtu5 = GTU(nb_chev_filter, time_strides_for_gtu_and_res, 5)
+        self.gtu7 = GTU(nb_chev_filter, time_strides_for_gtu_and_res, 7)
+
+        T_after_gtu3 = (num_of_timesteps_input - 3) // time_strides_for_gtu_and_res + 1
+        T_after_gtu5 = (num_of_timesteps_input - 5) // time_strides_for_gtu_and_res + 1
+        T_after_gtu7 = (num_of_timesteps_input - 7) // time_strides_for_gtu_and_res + 1
+        fcmy_input_time_dim = T_after_gtu3 + T_after_gtu5 + T_after_gtu7
+
+        self.fcmy = nn.Sequential(
+            nn.Linear(fcmy_input_time_dim, num_of_timesteps_input // time_strides_for_gtu_and_res),
+            nn.Dropout(0.05),
+        )
+
+        self.residual_conv = nn.Conv2d(in_channels_for_cheb, nb_chev_filter, kernel_size=(1, 1), stride=(1, time_strides_for_gtu_and_res))
+        self.layer_norm_output = nn.LayerNorm(nb_chev_filter)
+        self.dropout = nn.Dropout(p=0.05)
+
+        # === [新增] 将 TAt 的 F 维逐时刻映射到 d_model, 然后做逐时刻空间注意力 ===
+        self.tat_out_proj_time = nn.Conv2d(
+            in_channels=num_of_d_features_for_embedT,
+            out_channels=d_model_for_spatial_attn,
+            kernel_size=(1, 1)
+        )
+        self.SDE = SpatialDynamicExtractor(
+            DEVICE, num_of_vertices, d_model_for_spatial_attn,
+            d_k_for_attn, n_heads_for_attn=K_cheb,   # 与 Cheb 阶数对齐
+            use_temporal_smoothing=False
+        )
 
 
-class DSTAGNN_block(nn.Module): # DSTAGNN 单块模块
-    def __init__(self, DEVICE, num_of_d, in_channels, K_cheb, nb_chev_filter,
-                 nb_time_filter_unused, time_strides, cheb_polynomials, adj_pa_static, adj_TMD_static_unused,
-                 num_of_vertices, num_of_timesteps, d_model_for_spatial_attn, d_k_for_attn, d_v_for_attn,
-                 n_heads_for_attn, dynamic_attn_alpha: float = 0.5,
-                 use_sde: bool = True, sde_temporal_smoothing: bool = False, sde_smoothing_ksize: int = 3): # 初始化
-        super(DSTAGNN_block, self).__init__() #
-        self.use_sde = use_sde #
-        self.dynamic_attn_alpha = dynamic_attn_alpha #
+    def forward(self, x, res_att_prev):
+        batch_size, num_of_vertices, num_features_input, num_timesteps_input = x.shape
 
-        self.SAt = SMultiHeadAttention(DEVICE, d_model_for_spatial_attn,
-                                       d_k_for_attn, d_v_unused=None, n_heads=n_heads_for_attn) # 空间注意力
-        self.embedS = Embedding(num_of_vertices, d_model_for_spatial_attn,
-                                d_model_for_spatial_attn, 'S') # 空间位置编码
+        # === 原有 TAt ===
+        TEmx = self.EmbedT(x, batch_size)
+        TATout, tat_scores = self.TAt(TEmx, TEmx, TEmx, None, res_att_prev) # (B,F,T,N)
 
-        if self.use_sde: #
-            self.sde = SpatialDynamicExtractor(DEVICE, num_of_vertices, d_model_for_spatial_attn,
-                                               d_k_for_attn, n_heads_for_attn,
-                                               use_temporal_smoothing=sde_temporal_smoothing,
-                                               smoothing_kernel_size=sde_smoothing_ksize) # 动态空间提取器
-        else: #
-            self.sde = None #
+        # === [新增] SDE: 逐时刻空间注意力序列 sat_scores_seq (B,T,K,N,N) ===
+        x_tat_feat4conv = TATout.permute(0, 1, 3, 2)               # (B,F,N,T)
+        x_nodes_dmodel  = self.tat_out_proj_time(x_tat_feat4conv)  # (B,D,N,T)
+        node_tokens_time= x_nodes_dmodel.permute(0, 3, 2, 1)       # (B,T,N,D)
+        sat_scores_seq  = self.SDE(node_tokens_time)               # (B,T,K,N,N)
 
-        self.cheb_conv_SAt = cheb_conv_withSAt(K_cheb, cheb_polynomials, in_channels, nb_chev_filter,
-                                               num_of_vertices, dynamic_attn_alpha) # ChebConv
+        # === 原有静态 SAt ===
+        tat_permuted = TATout.permute(0,3,1,2) # (B,N,F,T)
+        x_TAt_projected = self.tat_output_proj(tat_permuted.reshape(batch_size, num_of_vertices, -1))
+        
+        SEmx_TAt = self.EmbedS(x_TAt_projected, batch_size)
+        SEmx_TAt_dropped = self.dropout(SEmx_TAt)
+        sat_scores_static = self.SAt(SEmx_TAt_dropped, SEmx_TAt_dropped, attn_mask=None) # (B,K,N,N) [静态 logits]
 
-        self.TAt = MultiHeadAttention(DEVICE, nb_chev_filter, d_k_for_attn, d_v_for_attn,
-                                      n_heads_for_attn, num_of_d) # 时间注意力
-        self.embedT = Embedding(num_of_timesteps, nb_chev_filter,
-                                nb_chev_filter, 'T') # 时间位置编码
+        # === [增强] 将动态 sat_scores_seq 注入 GCN 的邻接权重（可选） ===
+        if self.use_dynamic_spatial_for_gcn:
+            sat_dyn_avg = sat_scores_seq.mean(dim=1)  # (B,K,N,N) —— 动态 logits 的时间平均
+            alpha = self.dynamic_spatial_alpha
+            sat_scores_for_gcn = (1.0 - alpha) * sat_scores_static + alpha * sat_dyn_avg
+        else:
+            sat_dyn_avg = None
+            sat_scores_for_gcn = sat_scores_static
 
-        self.GTU3 = GTU_with_gate_weights(nb_chev_filter, time_strides, 3) # GTU k=3
-        self.GTU5 = GTU_with_gate_weights(nb_chev_filter, time_strides, 5) # GTU k=5
-        self.GTU7 = GTU_with_gate_weights(nb_chev_filter, time_strides, 7) # GTU k=7
+        spatial_gcn_out = self.cheb_conv_SAt(x, sat_scores_for_gcn, self.adj_pa_static) # 注意力驱动的图卷积
+        
+        # === 后续 GTU/MSTFE 与残差保持不变 ===
+        X_for_gtu = spatial_gcn_out.permute(0, 2, 1, 3)
 
-        self.bn = nn.BatchNorm2d(nb_chev_filter).to(DEVICE) # 批归一化
+        x_gtu3_out, gate3_weights = self.gtu3(X_for_gtu)
+        x_gtu5_out, gate5_weights = self.gtu5(X_for_gtu)
+        x_gtu7_out, gate7_weights = self.gtu7(X_for_gtu)
 
-    def forward(self, x, res_att): # 前向传播
-        batch_size, num_of_vertices, num_of_features, num_of_timesteps = x.shape #
+        time_conv_concat = torch.cat([x_gtu3_out, x_gtu5_out, x_gtu7_out], dim=-1)
+        
+        fcmy_input = time_conv_concat.permute(0,2,1,3)
+        time_conv_fcmy_out = self.fcmy(fcmy_input)
+        time_conv_processed = self.relu(time_conv_fcmy_out.permute(0,2,1,3))
 
-        # 空间注意力计算
-        x_embedS = self.embedS(x, batch_size)  # (B, N, F)
-        spatial_attention_scores = self.SAt(x_embedS, x_embedS, attn_mask=None)  # (B, H, N, N)
-
-        # 提取动态空间注意力序列（如果启用）
-        sat_scores_seq = None #
-        if self.use_sde: #
-            node_tokens_time = x.permute(0, 3, 1, 2)  # (B, T, N, F)
-            sat_scores_seq = self.sde(node_tokens_time)  # (B, T, H, N, N)
-
-        # ChebConv with SAt
-        graph_conv_res = self.cheb_conv_SAt(x, spatial_attention_scores,
-                                            self.adj_pa_static, sat_scores_seq)  # (B, N, F_out, T)
-
-        # 时间注意力计算
-        x_embedT = self.embedT(graph_conv_res, batch_size)  # (B, N, F_out, T)
-        x_TAt, tat_scores = self.TAt(x_embedT, x_embedT, x_embedT, None, res_att)  # (B, N, F_out, T), (B, F_out, H, T, T)? Wait, num_of_d_features = N? No, in MultiHeadAttention, num_of_d_features = num_of_d (initial=1, then nb_chev_filter?)
-
-        # 修正：MultiHeadAttention 的 num_of_d_features 应为 N (节点维)，但原代码中传入 num_of_d (特征维)。假设 num_of_d =1, 但后续块中 num_of_d = nb_chev_filter, 这可能有误。
-        # 假设正确：TAt 输入 (B, F, T, N) permuted from (B, N, F, T)
-
-        # GTU 多尺度
-        x_GTU3, gate3 = self.GTU3(x_TAt.permute(0, 2, 1, 3))  # (B, F_out, N, T_out), gate
-        x_GTU5, gate5 = self.GTU5(x_TAt.permute(0, 2, 1, 3)) #
-        x_GTU7, gate7 = self.GTU7(x_TAt.permute(0, 2, 1, 3)) #
-
-        x_GTU = (x_GTU3 + x_GTU5 + x_GTU7) / 3  # (B, F_out, N, T_out)
-
-        x_bn = self.bn(x_GTU)  # (B, F_out, N, T_out)
+        x_for_residual = x.permute(0, 2, 1, 3)
+        residual_transformed = self.residual_conv(x_for_residual)
+        
+        output_summed = residual_transformed + time_conv_processed
+        
+        ln_input = self.relu(output_summed).permute(0,2,3,1)
+        output_normalized = self.layer_norm_output(ln_input)
+        block_output = output_normalized.permute(0,1,3,2)
 
         internal_states = {
-            "sat_scores_seq": sat_scores_seq,
-            "tat_scores": tat_scores,
-            "gate_weights_gtu3": gate3,
-            "gate_weights_gtu5": gate5,
-            "gate_weights_gtu7": gate7
+            "tat_scores": tat_scores.detach(),
+            "sat_scores_static": sat_scores_static.detach(),                 # 静态 logits
+            "sat_scores_for_gcn": sat_scores_for_gcn.detach(),               # 实际用于GCN的 logits（静态或静态+动态混合）
+            "sat_scores_dyn_avg": (sat_dyn_avg.detach() if sat_dyn_avg is not None else torch.zeros_like(sat_scores_static.detach())),
+            "sat_scores_seq": sat_scores_seq,                                # 动态序列 logits（保留梯度，供 SDEHead 使用）
+            "gate_weights_gtu3": gate3_weights.detach(),
+            "gate_weights_gtu5": gate5_weights.detach(),
+            "gate_weights_gtu7": gate7_weights.detach()
         }
+        return block_output, tat_scores, internal_states
 
-        return x_bn.permute(0, 2, 1, 3), tat_scores.mean(dim=2).mean(dim=1), internal_states  # 输出, 平均 res_att, 内部状态
 
-
-class DSTAGNN_submodule(nn.Module): # DSTAGNN 主模块
-    def __init__(self, DEVICE, num_of_d_initial_feat, nb_block, initial_in_channels_cheb,
-                 K_cheb, nb_chev_filter, nb_time_filter_block_unused, initial_time_strides,
+class DSTAGNN_submodule(nn.Module):
+    def __init__(self, DEVICE, num_of_d_initial_feat, nb_block, initial_in_channels_cheb, K_cheb,
+                 nb_chev_filter, nb_time_filter_block_unused, initial_time_strides,
                  cheb_polynomials, adj_pa_static, adj_TMD_static_unused, num_for_predict_per_node,
-                 len_input_total, num_of_vertices, d_model_for_spatial_attn, d_k_for_attn,
-                 d_v_for_attn, n_heads_for_attn,
+                 len_input_total, num_of_vertices,
+                 d_model_for_spatial_attn, d_k_for_attn, d_v_for_attn, n_heads_for_attn,
                  task_type='regression', num_classes=None,
-                 output_memory=False, return_internal_states=False,
-                 use_sde: bool = True, sde_out_dim: int = 64, sde_num_segments: int = 4,
-                 sde_topk_edges: int = 16, sde_exclude_self: bool = True,
-                 exp_mode: str = "full"): # 初始化
-        super(DSTAGNN_submodule, self).__init__() #
+                 output_memory=False, return_internal_states=False):
+        super(DSTAGNN_submodule, self).__init__()
 
-        if output_memory: #
-            self.task_type = 'memory' #
-        else: #
-            self.task_type = task_type #
+        if output_memory:
+            self.task_type = 'memory'
+        else:
+            self.task_type = task_type
             
-        self.return_internal_states = return_internal_states #
-        self.num_of_vertices = num_of_vertices #
-        self.nb_chev_filter = nb_chev_filter #
-        self.len_input_total = len_input_total #
-        self.initial_time_strides = initial_time_strides #
-        self.nb_block = nb_block #
-        self.DEVICE = DEVICE #
-        self.exp_mode = exp_mode.lower()  # "full", "tat_only_cls", "gtu_only_cls", "mixed_cls"
-        assert self.exp_mode in ["full", "tat_only_cls", "gtu_only_cls", "mixed_cls"], \
-            "exp_mode 必须是 'full' 或 '*_cls' 之一。"
+        self.return_internal_states = return_internal_states
+        self.num_of_vertices = num_of_vertices
+        self.nb_chev_filter = nb_chev_filter
+        self.len_input_total = len_input_total
+        self.initial_time_strides = initial_time_strides
+        self.nb_block = nb_block
+        self.DEVICE = DEVICE
 
-        # 注册 buffer 以支持 DP/DDP
-        for k, poly in enumerate(cheb_polynomials): #
-            self.register_buffer(f'cheb_poly_{k}', poly) #
-        self.register_buffer('adj_pa_static', adj_pa_static) #
+        self.BlockList = nn.ModuleList()
+        current_num_of_d_for_embedT = num_of_d_initial_feat
+        current_in_channels_for_cheb = initial_in_channels_cheb
+        current_num_of_timesteps_input = len_input_total
+        current_time_strides_for_gtu = initial_time_strides
 
-        self.BlockList = nn.ModuleList() #
-        current_num_of_d_for_embedT = num_of_d_initial_feat #
-        current_in_channels_for_cheb = initial_in_channels_cheb #
-        current_num_of_timesteps_input = len_input_total #
-        current_time_strides_for_gtu = initial_time_strides #
-
-        for i in range(nb_block): #
-            self.BlockList.append(DSTAGNN_block(
-                DEVICE, current_num_of_d_for_embedT,
-                current_in_channels_for_cheb, K_cheb,
-                nb_chev_filter, nb_time_filter_block_unused,
-                current_time_strides_for_gtu,
-                cheb_polynomials, adj_pa_static, adj_TMD_static_unused,
-                num_of_vertices, current_num_of_timesteps_input,
-                d_model_for_spatial_attn, d_k_for_attn, d_v_for_attn,
-                n_heads_for_attn, use_sde=use_sde
-            )) #
-            current_num_of_d_for_embedT = nb_chev_filter #
-            current_in_channels_for_cheb = nb_chev_filter #
-            if current_time_strides_for_gtu > 0: #
-                 current_num_of_timesteps_input = \
-                     current_num_of_timesteps_input // current_time_strides_for_gtu #
-            current_time_strides_for_gtu = 1 #
+        for i in range(nb_block):
+            self.BlockList.append(DSTAGNN_block(DEVICE, current_num_of_d_for_embedT, current_in_channels_for_cheb, K_cheb,
+                                               nb_chev_filter, nb_time_filter_block_unused, current_time_strides_for_gtu,
+                                               cheb_polynomials, adj_pa_static, adj_TMD_static_unused,
+                                               num_of_vertices, current_num_of_timesteps_input,
+                                               d_model_for_spatial_attn, d_k_for_attn, d_v_for_attn, n_heads_for_attn))
+            current_num_of_d_for_embedT = nb_chev_filter
+            current_in_channels_for_cheb = nb_chev_filter
+            if current_time_strides_for_gtu > 0:
+                 current_num_of_timesteps_input = current_num_of_timesteps_input // current_time_strides_for_gtu
+            current_time_strides_for_gtu = 1
             
-        if initial_time_strides > 0: #
-            self.T_dim_per_block_out = len_input_total // initial_time_strides #
-        else: #
-            self.T_dim_per_block_out = len_input_total #
+        self.K_cheb = K_cheb
+        # SDE 并行特征头：输出维度采用 d_model_for_spatial_attn (=64) 以与主干维度同量级
+        self.sde_head = SDEParallelFeatureHead(
+            num_vertices=num_of_vertices,
+            n_heads=K_cheb,
+            out_dim=d_model_for_spatial_attn,
+            num_segments=4,
+            topk_edges=16,
+            exclude_self_edges=True,
+        )
 
-        concat_T_dim = self.T_dim_per_block_out * nb_block #
+        if initial_time_strides > 0:
+            self.T_dim_per_block_out = len_input_total // initial_time_strides
+        else:
+            self.T_dim_per_block_out = len_input_total
+
+        concat_T_dim = self.T_dim_per_block_out * nb_block
         
-        self.final_conv = None #
-        self.final_prediction_fc = None #
-        self.classification_head = None #
-        self.exporter_for_cls = TemporalSeqExporter() #
+        self.final_conv = None
+        self.final_prediction_fc = None
+        self.classification_head = None
 
-        if self.task_type == 'classification': #
-            if num_classes is None: #
-                raise ValueError("num_classes must be specified for classification.") #
-            
-            # ✅ 只做时间池化，保留节点维后：主干维度 = F * N
+        if self.task_type == 'classification':
+            if num_classes is None:
+                raise ValueError("num_classes must be specified for classification.")
+
+            # ================== 关键修正：只做时间池化，不对节点(N)做全平均 ==================
+            # 原实现用 adaptive_avg_pool2d(x_cls, (1,1)) 同时平均 (N,T)，
+            # MI 分类会把左右半球差异(如 C3/C4)硬抹掉，常见表现就是 Train Acc 很高
+            # 但 Val/Test 很差。
+            #
+            # 这里默认策略：
+            #   1) 只对时间维 T 做平均 -> (B,F,N)
+            #   2) 展平节点 -> (B, F*N)
+            #   3) 与 SDE 并行特征拼接 -> 分类
+            self.cls_pool_mode = "time_only_flatten"  # 备用: 你可以扩展为 node_attn 等
+
             feature_dim_main = nb_chev_filter * num_of_vertices
             feature_dim_sde  = d_model_for_spatial_attn
             feature_dim_total = feature_dim_main + feature_dim_sde
+
             self.classification_head = nn.Sequential(
-                nn.Linear(feature_dim_total, 128),
-                nn.ReLU(),
+                nn.LayerNorm(feature_dim_total),
+                nn.Linear(feature_dim_total, 256),
+                nn.ReLU(inplace=True),
                 nn.Dropout(0.5),
-                nn.Linear(128, num_classes)
-            ) #
-            print("[DSTAGNN] 初始化为分类模型（full 模式下主干池化特征 + SDE 并行特征）。")
+                nn.Linear(256, num_classes)
+            )
 
-            if use_sde: #
-                self.sde_head = SDEParallelFeatureHead(
-                    num_vertices=num_of_vertices, n_heads=n_heads_for_attn,
-                    out_dim=sde_out_dim, num_segments=sde_num_segments,
-                    topk_edges=sde_topk_edges, exclude_self_edges=sde_exclude_self
-                ) #
-            else: #
-                self.sde_head = None #
+            # 用于 exp_mode != "full" 时，把 (B,N) 的序列特征投影到与 x_main 相同的维度 (B,F*N)
+            # 这样不会因为维度对齐 hack 导致直接报错。
+            self.seq_feat_proj = nn.Linear(num_of_vertices, feature_dim_main)
+            print("[DSTAGNN] 初始化为分类模型（time-only pool，不平均节点）")
 
-        elif self.task_type == 'memory' or self.task_type == 'regression': #
-            self.final_conv_in_channels = concat_T_dim #
-            self.final_conv_kernel_feat_dim = nb_chev_filter #
-            if self.final_conv_in_channels > 0: #
-                self.final_conv = nn.Conv2d(
-                    self.final_conv_in_channels, 128,
-                    kernel_size=(1, self.final_conv_kernel_feat_dim)) #
-                self.final_prediction_fc = nn.Linear(128, num_for_predict_per_node) #
+        elif self.task_type == 'regression' or self.task_type == 'memory':
+            self.final_conv_in_channels = concat_T_dim
+            self.final_conv_kernel_feat_dim = nb_chev_filter
+            if self.final_conv_in_channels > 0:
+                self.final_conv = nn.Conv2d(self.final_conv_in_channels, 128, kernel_size=(1, self.final_conv_kernel_feat_dim))
+                self.final_prediction_fc = nn.Linear(128, num_for_predict_per_node)
             
-            if self.task_type == 'regression': #
-                print("[DSTAGNN] 初始化为回归模型。") #
-            else: #
-                 print("[DSTAGNN] 初始化为特征提取器 (Memory输出)。") #
+            if self.task_type == 'regression':
+                print("[DSTAGNN] 初始化为回归模型。")
+            else:
+                 print("[DSTAGNN] 初始化为特征提取器 (Memory输出)。")
 
-        self.to(DEVICE) #
+        # 为可解释性分析和消融实验新增的属性
+        self.exp_mode = "full"   # 可选: "tat_only_cls", "gtu_only_cls", "mixed_cls", "full"
+        self.exporter_for_cls = TemporalSeqExporter()
+        
+        self.to(DEVICE)
     
-    def export_time_feature_sequences(self, x): # 导出时间序列特征
-        """用于后续可能的消融实验，保留此接口"""
-        self.eval() #
-        with torch.no_grad(): #
-            block_outputs_concat_time = [] #
-            res_att_prev = 0 #
-            current_x_for_block = x #
-            current_block_internal_states = None #
+    def export_time_feature_sequences(self, x):
+        """
+        输入:
+          x: 模型标准输入 (B, N, 1, T)
+        输出:
+          dict: {
+            'tat_only': (B,N,T),
+            'gtu_only': (B,N,T),
+            'mixed':    (B,N,T),
+            'meta': { 'T': T, 'N': N }
+          }
+        说明:
+          - 只前向一次，抓取最后一个 Block 的内部状态做序列构建
+          - 不改变分类/回归输出
+        """
+        self.eval()
+        with torch.no_grad():
+            block_outputs_concat_time = []
+            res_att_prev = 0
+            current_x_for_block = x
+            current_block_internal_states = None
 
-            for i, block in enumerate(self.BlockList): #
-                block_output, res_att_current, current_block_internal_states = block(current_x_for_block, res_att_prev) #
-                block_outputs_concat_time.append(block_output) #
-                res_att_prev = res_att_current #
-                current_x_for_block = block_output #
+            for i, block in enumerate(self.BlockList):
+                block_output, res_att_current, current_block_internal_states = block(current_x_for_block, res_att_prev)
+                block_outputs_concat_time.append(block_output)
+                res_att_prev = res_att_current
+                current_x_for_block = block_output
 
             # 抓取最后一个 block 的内部状态
-            states = current_block_internal_states #
+            states = current_block_internal_states
             tat_scores = states["tat_scores"]                # (B,F,H,T,T)
             gate3 = states["gate_weights_gtu3"]              # (B,F,N,T3)
-            gate5 = states["gate_weights_gtu5"] #
-            gate7 = states["gate_weights_gtu7"] #
+            gate5 = states["gate_weights_gtu5"]
+            gate7 = states["gate_weights_gtu7"]
 
             # 同步得到 T/N/F
-            B, _, H, T, _ = tat_scores.shape #
-            _, _, N, _ = gate3.shape #
+            B, _, H, T, _ = tat_scores.shape
+            _, _, N, _ = gate3.shape
 
             # 需要 TAt 的节点级输出 TATout: 可从同一 block 的 TAt 输出处再算一次（轻量）
             # 复用 EmbedT 和 TAt（不返回scores）
             # 注意：这里的输入应该是最后一个block的输入，即current_x_for_block在上一个循环结束时的值，但由于输入维度(N,F,T)中F变化，直接用原始x更简单且对于时间注意力分析是合理的。
-            original_x_input_for_last_block = x if len(self.BlockList) == 1 else block_outputs_concat_time[-2] #
-            TEmx = self.BlockList[-1].EmbedT(original_x_input_for_last_block, original_x_input_for_last_block.size(0)) #
+            original_x_input_for_last_block = x if len(self.BlockList) == 1 else block_outputs_concat_time[-2]
+            TEmx = self.BlockList[-1].EmbedT(original_x_input_for_last_block, original_x_input_for_last_block.size(0))
             TATout, _ = self.BlockList[-1].TAt(TEmx, TEmx, TEmx, None, 0)   # (B,F,T,N)
 
-            exporter = TemporalSeqExporter() #
+            exporter = TemporalSeqExporter()
             tat_seq_node = exporter.tat_only(tat_scores, TATout)            # (B,N,T)
             gtu_ms_seq   = exporter.gtu_only(gate3, gate5, gate7, T)        # (B,N,T)
-            mixed_seq    = exporter.mixed(tat_seq_node, gtu_ms_seq, alpha=0.5) #
+            mixed_seq    = exporter.mixed(tat_seq_node, gtu_ms_seq, alpha=0.5)
 
             return {
                 "tat_only": tat_seq_node.cpu(),
                 "gtu_only": gtu_ms_seq.cpu(),
                 "mixed": mixed_seq.cpu(),
                 "meta": {"T": T, "N": N}
-            } #
+            }
 
-    def forward(self, x): # 前向传播
-        block_outputs_concat_time = [] #
-        res_att_prev = 0 #
-        all_blocks_internal_states = [] #
-        current_x_for_block = x #
+    def forward(self, x):
+        block_outputs_concat_time = []
+        res_att_prev = 0
+        all_blocks_internal_states = []
+        current_x_for_block = x
         current_block_internal_states = {} # 确保在循环外有定义
 
-        for i, block in enumerate(self.BlockList): #
-            block_output, res_att_current, current_block_internal_states = block(current_x_for_block, res_att_prev) #
-            block_outputs_concat_time.append(block_output) #
-            if self.return_internal_states: #
-                all_blocks_internal_states.append(current_block_internal_states) #
-            res_att_prev = res_att_current #
-            current_x_for_block = block_output #
+        for i, block in enumerate(self.BlockList):
+            block_output, res_att_current, current_block_internal_states = block(current_x_for_block, res_att_prev)
+            block_outputs_concat_time.append(block_output)
+            if self.return_internal_states:
+                all_blocks_internal_states.append(current_block_internal_states)
+            res_att_prev = res_att_current
+            current_x_for_block = block_output
 
-        final_x_from_blocks = torch.cat(block_outputs_concat_time, dim=-1) #
+        final_x_from_blocks = torch.cat(block_outputs_concat_time, dim=-1)
 
-        output = None #
+        output = None
 
-        if self.task_type == 'classification': #
+        if self.task_type == 'classification':
             x_cls = final_x_from_blocks.permute(0, 2, 1, 3)   # (B, F, N, T)
-
-            # ✅ 关键修正：只在时间维 T 上做池化，保留导联/节点 N 的差异
-            x_time = x_cls.mean(dim=-1)                       # (B, F, N)
-
-            # 展平得到分类向量：每个导联都有自己的 F 维表示
-            x_main = x_time.contiguous().view(x_time.size(0), -1)  # (B, F*N)
+            # 只在时间维做池化，保留节点差异
+            # (B, F, N, T) -> (B, F, N)
+            x_time = x_cls.mean(dim=-1)
+            # (B, F, N) -> (B, F*N)
+            x_main = x_time.reshape(x_time.size(0), -1)
 
             # --- 分类头输入构建 ---
-            if self.exp_mode == "full": #
+            if self.exp_mode == "full":
                 # 现有路径：主干池化 + SDE 并行特征
-                sat_seq_last = current_block_internal_states.get("sat_scores_seq", None) #
-                if sat_seq_last is None: #
-                    sde_emb = torch.zeros(x_main.size(0), self.sde_head.out_dim, device=x_main.device, dtype=x_main.dtype) #
-                else: #
-                    sde_emb = self.sde_head(sat_seq_last) #
-                x_concat = torch.cat([x_main, sde_emb], dim=1) #
-            else: #
+                sat_seq_last = current_block_internal_states.get("sat_scores_seq", None)
+                if sat_seq_last is None:
+                    sde_emb = torch.zeros(x_main.size(0), self.sde_head.out_dim, device=x_main.device, dtype=x_main.dtype)
+                else:
+                    sde_emb = self.sde_head(sat_seq_last)
+                x_concat = torch.cat([x_main, sde_emb], dim=1)
+            else:
                 # 构造三种“时间解释序列”的分类特征（与 aECG 物理对齐）
-                states = current_block_internal_states #
+                states = current_block_internal_states
                 tat_scores = states["tat_scores"]                        # (B,F,H,T,T)
-                gate3 = states["gate_weights_gtu3"]; gate5 = states["gate_weights_gtu5"]; gate7 = states["gate_weights_gtu7"] #
-                B, _, H, T, _ = tat_scores.shape #
+                gate3 = states["gate_weights_gtu3"]; gate5 = states["gate_weights_gtu5"]; gate7 = states["gate_weights_gtu7"]
+                B, _, H, T, _ = tat_scores.shape
                 
-                original_x_input_for_last_block = x if len(self.BlockList) == 1 else block_outputs_concat_time[-2] #
-                TEmx = self.BlockList[-1].EmbedT(original_x_input_for_last_block, original_x_input_for_last_block.size(0)) #
+                original_x_input_for_last_block = x if len(self.BlockList) == 1 else block_outputs_concat_time[-2]
+                TEmx = self.BlockList[-1].EmbedT(original_x_input_for_last_block, original_x_input_for_last_block.size(0))
                 TATout, _ = self.BlockList[-1].TAt(TEmx, TEmx, TEmx, None, 0)  # (B,F,T,N)
 
                 tat_seq_node = self.exporter_for_cls.tat_only(tat_scores, TATout)         # (B,N,T)
                 gtu_ms_seq   = self.exporter_for_cls.gtu_only(gate3, gate5, gate7, T)     # (B,N,T)
                 
-                if self.exp_mode == "tat_only_cls": #
-                    seq = tat_seq_node #
-                elif self.exp_mode == "gtu_only_cls": #
-                    seq = gtu_ms_seq #
-                else:  # "mixed_cls" #
-                    seq = self.exporter_for_cls.mixed(tat_seq_node, gtu_ms_seq, alpha=0.5) #
+                if self.exp_mode == "tat_only_cls":
+                    seq = tat_seq_node
+                elif self.exp_mode == "gtu_only_cls":
+                    seq = gtu_ms_seq
+                else:  # "mixed_cls"
+                    seq = self.exporter_for_cls.mixed(tat_seq_node, gtu_ms_seq, alpha=0.5)
 
-                # 将 (B,N,T) 池化成 (B, F_feat) 再分类 —— 例如 (全局平均池化 + MLP)
+                # 将 (B,N,T) -> (B,N) 再投影到 (B,F*N)，避免维度 hack 直接报错
                 seq_feat = seq.mean(dim=-1)                  # (B,N)
-                seq_feat = F.layer_norm(seq_feat, (seq_feat.size(-1),)) #
-                
-                # 注意：此处的维度对齐方式是按照您的要求直接实现的。
-                # 这可能会导致 seq_feat 和 x_main 的维度拼接后与分类头预期的输入维度不匹配。
-                # 在运行消融实验时，您可能需要调整分类头(self.classification_head)的输入维度，
-                # 或修改此处的特征构造方式，例如使用一个线性层将 seq_feat 投影到期望的维度。
-                seq_feat_expand = seq_feat.unsqueeze(1).repeat(1, x_cls.size(1), 1)  # (B,F,N)
-                seq_feat_expand = seq_feat_expand.contiguous().view(seq_feat_expand.size(0), -1)  # (B,F*N)
-                sde_zero = torch.zeros(seq_feat_expand.size(0), self.sde_head.out_dim,
-                                       device=seq_feat_expand.device, dtype=seq_feat_expand.dtype)
-                x_concat = torch.cat([seq_feat_expand, sde_zero], dim=1)
+                seq_feat = F.layer_norm(seq_feat, (seq_feat.size(-1),))
+                seq_proj = self.seq_feat_proj(seq_feat)      # (B, F*N)
+                sde_pad = torch.zeros(seq_proj.size(0), self.sde_head.out_dim, device=seq_proj.device, dtype=seq_proj.dtype)
+                x_concat = torch.cat([seq_proj, sde_pad], dim=1)
             
-            output = self.classification_head(x_concat) #
+            output = self.classification_head(x_concat)
 
-        elif self.task_type == 'memory': #
-            B, N, F_mem_block, T_concat = final_x_from_blocks.shape #
-            if self.num_of_vertices == 1: #
-                memory = final_x_from_blocks.squeeze(1).permute(0, 2, 1) #
-            else: #
-                memory = final_x_from_blocks.permute(0, 3, 1, 2).reshape(B, T_concat, N * F_mem_block) #
-            output = memory #
+        elif self.task_type == 'memory':
+            B, N, F_mem_block, T_concat = final_x_from_blocks.shape
+            if self.num_of_vertices == 1:
+                memory = final_x_from_blocks.squeeze(1).permute(0, 2, 1)
+            else:
+                memory = final_x_from_blocks.permute(0, 3, 1, 2).reshape(B, T_concat, N * F_mem_block)
+            output = memory
 
-        elif self.task_type == 'regression': #
-            conv_input = final_x_from_blocks.permute(0, 3, 1, 2) #
-            output1 = self.final_conv(conv_input).squeeze(-1) #
-            output1_permuted = output1.permute(0,2,1) #
-            output = self.final_prediction_fc(output1_permuted) #
+        elif self.task_type == 'regression':
+            conv_input = final_x_from_blocks.permute(0, 3, 1, 2)
+            output1 = self.final_conv(conv_input).squeeze(-1)
+            output1_permuted = output1.permute(0,2,1)
+            output = self.final_prediction_fc(output1_permuted)
 
-        if self.return_internal_states: #
-            return output, all_blocks_internal_states #
-        else: #
-            return output #
+        if self.return_internal_states:
+            return output, all_blocks_internal_states
+        else:
+            return output
 
 
 def make_model(DEVICE, num_of_d_initial_feat, nb_block, initial_in_channels_cheb, K_cheb,
