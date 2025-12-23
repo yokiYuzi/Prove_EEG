@@ -548,7 +548,6 @@ class DSTAGNN_block(nn.Module): # DSTAGNN的核心块
                  cheb_polynomials, adj_pa_static, adj_TMD_static_unused, 
                  num_of_vertices, num_of_timesteps_input,
                  d_model_for_spatial_attn, d_k_for_attn, d_v_for_attn, n_heads_for_attn,
-                 use_sde: bool = True,
                  use_dynamic_spatial_for_gcn: bool = True, dynamic_spatial_alpha: float = 0.5):
         super(DSTAGNN_block, self).__init__()
 
@@ -557,12 +556,8 @@ class DSTAGNN_block(nn.Module): # DSTAGNN的核心块
         # ✅ [修改] 注册静态邻接矩阵为 buffer
         self.register_buffer('adj_pa_static', torch.as_tensor(adj_pa_static, dtype=torch.float32))
 
-        # === [可选] SDE 开关（是否计算动态空间注意力序列） ===
-        self.use_sde = bool(use_sde)
-
         # === [新增] 动态空间注意力是否注入 GCN（默认开启，可在构建模型时关闭） ===
-        # 注意：如果 use_sde=False，则无法得到动态空间注意力序列，因此自动关闭注入。
-        self.use_dynamic_spatial_for_gcn = bool(use_dynamic_spatial_for_gcn) and self.use_sde
+        self.use_dynamic_spatial_for_gcn = bool(use_dynamic_spatial_for_gcn)
         self.dynamic_spatial_alpha = float(dynamic_spatial_alpha)
         if self.dynamic_spatial_alpha < 0.0:
             self.dynamic_spatial_alpha = 0.0
@@ -596,21 +591,17 @@ class DSTAGNN_block(nn.Module): # DSTAGNN的核心块
         self.layer_norm_output = nn.LayerNorm(nb_chev_filter)
         self.dropout = nn.Dropout(p=0.05)
 
-        # === [可选] SDE: 将 TAt 的 F 维逐时刻映射到 d_model, 然后做逐时刻空间注意力 ===
-        if self.use_sde:
-            self.tat_out_proj_time = nn.Conv2d(
-                in_channels=num_of_d_features_for_embedT,
-                out_channels=d_model_for_spatial_attn,
-                kernel_size=(1, 1)
-            )
-            self.SDE = SpatialDynamicExtractor(
-                DEVICE, num_of_vertices, d_model_for_spatial_attn,
-                d_k_for_attn, n_heads_for_attn=K_cheb,   # 与 Cheb 阶数对齐
-                use_temporal_smoothing=False
-            )
-        else:
-            self.tat_out_proj_time = None
-            self.SDE = None
+        # === [新增] 将 TAt 的 F 维逐时刻映射到 d_model, 然后做逐时刻空间注意力 ===
+        self.tat_out_proj_time = nn.Conv2d(
+            in_channels=num_of_d_features_for_embedT,
+            out_channels=d_model_for_spatial_attn,
+            kernel_size=(1, 1)
+        )
+        self.SDE = SpatialDynamicExtractor(
+            DEVICE, num_of_vertices, d_model_for_spatial_attn,
+            d_k_for_attn, n_heads_for_attn=K_cheb,   # 与 Cheb 阶数对齐
+            use_temporal_smoothing=False
+        )
 
 
     def forward(self, x, res_att_prev):
@@ -620,14 +611,11 @@ class DSTAGNN_block(nn.Module): # DSTAGNN的核心块
         TEmx = self.EmbedT(x, batch_size)
         TATout, tat_scores = self.TAt(TEmx, TEmx, TEmx, None, res_att_prev) # (B,F,T,N)
 
-        # === [可选] SDE: 逐时刻空间注意力序列 sat_scores_seq (B,T,K,N,N) ===
-        if self.use_sde:
-            x_tat_feat4conv = TATout.permute(0, 1, 3, 2)               # (B,F,N,T)
-            x_nodes_dmodel  = self.tat_out_proj_time(x_tat_feat4conv)  # (B,D,N,T)
-            node_tokens_time= x_nodes_dmodel.permute(0, 3, 2, 1)       # (B,T,N,D)
-            sat_scores_seq  = self.SDE(node_tokens_time)               # (B,T,K,N,N)
-        else:
-            sat_scores_seq = None
+        # === [新增] SDE: 逐时刻空间注意力序列 sat_scores_seq (B,T,K,N,N) ===
+        x_tat_feat4conv = TATout.permute(0, 1, 3, 2)               # (B,F,N,T)
+        x_nodes_dmodel  = self.tat_out_proj_time(x_tat_feat4conv)  # (B,D,N,T)
+        node_tokens_time= x_nodes_dmodel.permute(0, 3, 2, 1)       # (B,T,N,D)
+        sat_scores_seq  = self.SDE(node_tokens_time)               # (B,T,K,N,N)
 
         # === 原有静态 SAt ===
         tat_permuted = TATout.permute(0,3,1,2) # (B,N,F,T)
@@ -690,10 +678,7 @@ class DSTAGNN_submodule(nn.Module):
                  len_input_total, num_of_vertices,
                  d_model_for_spatial_attn, d_k_for_attn, d_v_for_attn, n_heads_for_attn,
                  task_type='regression', num_classes=None,
-                 output_memory=False, return_internal_states=False,
-                 use_sde: bool = True,
-                 use_dynamic_spatial_for_gcn: bool = True,
-                 dynamic_spatial_alpha: float = 0.5):
+                 output_memory=False, return_internal_states=False):
         super(DSTAGNN_submodule, self).__init__()
 
         if output_memory:
@@ -708,11 +693,6 @@ class DSTAGNN_submodule(nn.Module):
         self.initial_time_strides = initial_time_strides
         self.nb_block = nb_block
         self.DEVICE = DEVICE
-        # ===== 消融开关：是否启用 SDE（动态空间注意力） =====
-        self.use_sde = bool(use_sde)
-        self.use_dynamic_spatial_for_gcn = bool(use_dynamic_spatial_for_gcn)
-        self.dynamic_spatial_alpha = float(dynamic_spatial_alpha)
-
 
         self.BlockList = nn.ModuleList()
         current_num_of_d_for_embedT = num_of_d_initial_feat
@@ -725,10 +705,7 @@ class DSTAGNN_submodule(nn.Module):
                                                nb_chev_filter, nb_time_filter_block_unused, current_time_strides_for_gtu,
                                                cheb_polynomials, adj_pa_static, adj_TMD_static_unused,
                                                num_of_vertices, current_num_of_timesteps_input,
-                                               d_model_for_spatial_attn, d_k_for_attn, d_v_for_attn, n_heads_for_attn,
-                                               use_sde=self.use_sde,
-                                               use_dynamic_spatial_for_gcn=self.use_dynamic_spatial_for_gcn,
-                                               dynamic_spatial_alpha=self.dynamic_spatial_alpha))
+                                               d_model_for_spatial_attn, d_k_for_attn, d_v_for_attn, n_heads_for_attn))
             current_num_of_d_for_embedT = nb_chev_filter
             current_in_channels_for_cheb = nb_chev_filter
             if current_time_strides_for_gtu > 0:
@@ -736,18 +713,15 @@ class DSTAGNN_submodule(nn.Module):
             current_time_strides_for_gtu = 1
             
         self.K_cheb = K_cheb
-        # SDE 并行特征头（可选）：用于将动态空间注意力序列压缩成向量并拼接到分类头。
-        if self.use_sde:
-            self.sde_head = SDEParallelFeatureHead(
-                num_vertices=num_of_vertices,
-                n_heads=K_cheb,
-                out_dim=d_model_for_spatial_attn,
-                num_segments=4,
-                topk_edges=16,
-                exclude_self_edges=True,
-            )
-        else:
-            self.sde_head = None
+        # SDE 并行特征头：输出维度采用 d_model_for_spatial_attn (=64) 以与主干维度同量级
+        self.sde_head = SDEParallelFeatureHead(
+            num_vertices=num_of_vertices,
+            n_heads=K_cheb,
+            out_dim=d_model_for_spatial_attn,
+            num_segments=4,
+            topk_edges=16,
+            exclude_self_edges=True,
+        )
 
         if initial_time_strides > 0:
             self.T_dim_per_block_out = len_input_total // initial_time_strides
@@ -776,7 +750,7 @@ class DSTAGNN_submodule(nn.Module):
             self.cls_pool_mode = "time_only_flatten"  # 备用: 你可以扩展为 node_attn 等
 
             feature_dim_main = nb_chev_filter * num_of_vertices
-            feature_dim_sde  = (d_model_for_spatial_attn if self.use_sde else 0)
+            feature_dim_sde  = d_model_for_spatial_attn
             feature_dim_total = feature_dim_main + feature_dim_sde
 
             self.classification_head = nn.Sequential(
@@ -897,16 +871,13 @@ class DSTAGNN_submodule(nn.Module):
 
             # --- 分类头输入构建 ---
             if self.exp_mode == "full":
-                # 主干池化特征（time-only pool, 保留节点差异）
-                if self.use_sde and (self.sde_head is not None):
-                    sat_seq_last = current_block_internal_states.get("sat_scores_seq", None)
-                    if sat_seq_last is None:
-                        sde_emb = torch.zeros(x_main.size(0), self.sde_head.out_dim, device=x_main.device, dtype=x_main.dtype)
-                    else:
-                        sde_emb = self.sde_head(sat_seq_last)
-                    x_concat = torch.cat([x_main, sde_emb], dim=1)
+                # 现有路径：主干池化 + SDE 并行特征
+                sat_seq_last = current_block_internal_states.get("sat_scores_seq", None)
+                if sat_seq_last is None:
+                    sde_emb = torch.zeros(x_main.size(0), self.sde_head.out_dim, device=x_main.device, dtype=x_main.dtype)
                 else:
-                    x_concat = x_main
+                    sde_emb = self.sde_head(sat_seq_last)
+                x_concat = torch.cat([x_main, sde_emb], dim=1)
             else:
                 # 构造三种“时间解释序列”的分类特征（与 aECG 物理对齐）
                 states = current_block_internal_states
@@ -932,11 +903,8 @@ class DSTAGNN_submodule(nn.Module):
                 seq_feat = seq.mean(dim=-1)                  # (B,N)
                 seq_feat = F.layer_norm(seq_feat, (seq_feat.size(-1),))
                 seq_proj = self.seq_feat_proj(seq_feat)      # (B, F*N)
-                if self.use_sde and (self.sde_head is not None):
-                    sde_pad = torch.zeros(seq_proj.size(0), self.sde_head.out_dim, device=seq_proj.device, dtype=seq_proj.dtype)
-                    x_concat = torch.cat([seq_proj, sde_pad], dim=1)
-                else:
-                    x_concat = seq_proj
+                sde_pad = torch.zeros(seq_proj.size(0), self.sde_head.out_dim, device=seq_proj.device, dtype=seq_proj.dtype)
+                x_concat = torch.cat([seq_proj, sde_pad], dim=1)
             
             output = self.classification_head(x_concat)
 
@@ -964,10 +932,7 @@ def make_model(DEVICE, num_of_d_initial_feat, nb_block, initial_in_channels_cheb
                nb_chev_filter, nb_time_filter_block_unused, initial_time_strides, adj_mx, adj_pa_static,
                adj_TMD_static_unused, num_for_predict_per_node, len_input_total, num_of_vertices,
                d_model_for_spatial_attn, d_k_for_attn, d_v_for_attn, n_heads_for_attn,
-               task_type='regression', num_classes=None, output_memory=False, return_internal_states=False,
-               use_sde: bool = True,
-               use_dynamic_spatial_for_gcn: bool = True,
-               dynamic_spatial_alpha: float = 0.5
+               task_type='regression', num_classes=None, output_memory=False, return_internal_states=False
                ):
     if isinstance(adj_mx, np.ndarray):
         adj_mx_tensor = torch.from_numpy(adj_mx).float().to(DEVICE)
@@ -996,10 +961,7 @@ def make_model(DEVICE, num_of_d_initial_feat, nb_block, initial_in_channels_cheb
                              d_v_for_attn, n_heads_for_attn,
                              task_type=task_type, num_classes=num_classes,
                              output_memory=output_memory,
-                             return_internal_states=return_internal_states,
-                             use_sde=use_sde,
-                             use_dynamic_spatial_for_gcn=use_dynamic_spatial_for_gcn,
-                             dynamic_spatial_alpha=dynamic_spatial_alpha)
+                             return_internal_states=return_internal_states)
 
     for p in model.parameters():
         if p.dim() > 1:
