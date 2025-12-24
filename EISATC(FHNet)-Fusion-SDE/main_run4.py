@@ -37,8 +37,8 @@ from DSTAGNN_my1 import make_model
 
 # ================== 实验开关（你只需要改这里 4 个） ==================
 USE_SDE: bool = False                 # 1) 是否使用 SDE（动态空间注意力）
-USE_8_LEADS: bool = True            # 2) 是否使用 8 导联（缩减版）
-USE_FILTERBANK: bool = False         # 3) 是否使用滤波器组分离频带（False=STFT频带功率）
+USE_8_LEADS: bool = False            # 2) 是否使用 8 导联（缩减版）
+USE_FILTERBANK: bool = True         # 3) 是否使用滤波器组分离频带（False=STFT频带功率）
 INPUT_SECONDS: float = 4.0           # 4) 输入长度（2.0 或 4.0）
 
 # 输入裁剪方式（不是 4 个核心参数之一，但通常不需要改）
