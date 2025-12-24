@@ -37,13 +37,19 @@ from DSTAGNN_my1 import make_model
 
 # ================== 实验开关（你只需要改这里 4 个） ==================
 USE_SDE: bool = True                 # 1) 是否使用 SDE（动态空间注意力）
-USE_8_LEADS: bool = False            # 2) 是否使用 8 导联（缩减版）
+USE_8_LEADS: bool = True            # 2) 是否使用 8 导联（缩减版）
 USE_FILTERBANK: bool = False         # 3) 是否使用滤波器组分离频带（False=STFT频带功率）
 INPUT_SECONDS: float = 4.0           # 4) 输入长度（2.0 或 4.0）
 
 # 输入裁剪方式（不是 4 个核心参数之一，但通常不需要改）
 CROP_MODE: str = "start"             # "start" 或 "center"
 
+
+# 标准化方式（在 dataLoad/preprocess.py 中实现）
+#   - "channel_global": 每通道 1 套统计(训练集 trial*time)，更典型，适合跨 session
+#   - "trial": 每 trial 内 z-score，更鲁棒但会抹掉幅度信息
+#   - "timepoint_across_trials": 旧方式（逐时间点拟合），不推荐
+STANDARDIZE_MODE: str = "channel_global"
 
 # ================== 基础超参数（训练相关） ==================
 NUM_CLASSES = 4
@@ -490,6 +496,7 @@ def main():
         print(f"  - USE_8_LEADS={USE_8_LEADS} | NUM_CHANNELS={num_channels} | channels={channels_used}")
         print(f"  - USE_FILTERBANK={USE_FILTERBANK} | feature={feat_name} | bands={BANDS}")
         print(f"  - INPUT_SECONDS={INPUT_SECONDS} | input_samples={input_samples} | T_frames={t_frames}")
+        print(f"  - standardize_mode={STANDARDIZE_MODE}")
         print("=" * 70)
 
     # ----------------- 路径 -----------------
@@ -501,7 +508,8 @@ def main():
 
     # ----------------- 1) 读取数据（Session T / Session E） -----------------
     X_train, y_train, X_test, y_test, _, _ = get_data(
-        path=data_dir, subject=subject, LOSO=False, data_type='2a'
+        path=data_dir, subject=subject, LOSO=False, data_type='2a',
+        standardize_mode=STANDARDIZE_MODE
     )   # X_train = Session T, X_test = Session E
 
     # ----------------- 2) 通道选择 & 时间裁剪（Train/Val/Test 全部一致） -----------------
