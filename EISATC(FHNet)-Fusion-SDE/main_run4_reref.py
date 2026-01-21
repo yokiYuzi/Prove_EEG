@@ -122,9 +122,37 @@ CHAN_POS_2A = {
 LEADS_8 = ["CP3", "C3", "CP4", "FC1", "C4", "P1", "FC2", "C1"]
 
 
+# ================== [MOD] 数据中真实的通道顺序（用于索引/裁剪） ==================
+# get_data(...) 返回的 X 默认是 22 通道 CHANNELS_2A 的顺序；
+# 若在 preprocess_reref.get_data(..., drop_ref=True) 删除了参考通道，则这里也会同步少 1 个通道。
+DATA_CHANNELS_2A = list(CHANNELS_2A)
+if USE_REREF and DROP_REF_CHANNEL:
+    if REREF_CHANNEL not in DATA_CHANNELS_2A:
+        raise ValueError(
+            f"[Config Error] REREF_CHANNEL='{REREF_CHANNEL}' 不在 CHANNELS_2A 中，无法 drop。"
+        )
+    DATA_CHANNELS_2A.remove(REREF_CHANNEL)
+
+
 def get_channels_used() -> list:
-    """根据 USE_8_LEADS 返回当前使用的通道列表（其顺序即图节点顺序）。"""
-    return LEADS_8 if USE_8_LEADS else CHANNELS_2A
+    """
+    根据 USE_8_LEADS 返回当前使用的通道列表（其顺序即图节点顺序）。
+
+    [MOD] 当使用单点重参考 X' = X - X_ref 时：
+      - 参考通道本身会变为全 0（见 preprocess_reref 说明）
+      - 作为模型输入/图节点没有意义，因此这里默认把该参考通道从 channels_used 中移除
+    """
+    chs = list(LEADS_8) if USE_8_LEADS else list(DATA_CHANNELS_2A)
+
+    # 单点重参考下，ref 通道=0（若你不 drop_ref），所以不作为模型输入
+    if USE_REREF and (REREF_CHANNEL in chs):
+        chs = [c for c in chs if c != REREF_CHANNEL]
+
+    # sanity check
+    if len(chs) != len(set(chs)):
+        raise ValueError(f"channels_used 内存在重复通道: {chs}")
+
+    return chs
 
 
 def build_eeg_2a_adj(
@@ -189,13 +217,13 @@ def select_and_crop_channels(
     从原始 22 导数据中选择通道，并裁剪到指定输入长度。
     输出: (Trials, len(channels_used), input_samples)
     """
-    X = ensure_trials_C_T(X, n_total_channels=len(CHANNELS_2A))
+    X = ensure_trials_C_T(X, n_total_channels=len(DATA_CHANNELS_2A))
 
-    missing = [ch for ch in channels_used if ch not in CHANNELS_2A]
+    missing = [ch for ch in channels_used if ch not in DATA_CHANNELS_2A]
     if len(missing) > 0:
-        raise ValueError(f"这些导联不在 BCICIV-2a 的 22 导列表 CHANNELS_2A 中: {missing}")
+        raise ValueError(f"这些导联不在当前数据通道列表 DATA_CHANNELS_2A 中: {missing}")
 
-    used_idx = [CHANNELS_2A.index(ch) for ch in channels_used]
+    used_idx = [DATA_CHANNELS_2A.index(ch) for ch in channels_used]
     X = X[:, used_idx, :]  # (Trials, C_used, T)
 
     T = X.shape[-1]
