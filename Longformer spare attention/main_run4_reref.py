@@ -43,13 +43,27 @@ DROP_REF_CHANNEL: bool = False  # True 会让通道数减少（如 22->21），�
 
 
 # ================== 实验开关（你只需要改这里 4 个） ==================
-USE_SDE: bool = True                 # 1) 是否使用 SDE（动态空间注意力）
+USE_SDE: bool = False                 # 1) 是否使用 SDE（动态空间注意力）
 USE_8_LEADS: bool = False            # 2) 是否使用 8 导联（缩减版）
 USE_FILTERBANK: bool = True         # 3) 是否使用滤波器组分离频带（False=STFT频带功率）
 INPUT_SECONDS: float = 4.0           # 4) 输入长度（2.0 或 4.0）
 
 # 输入裁剪方式（不是 4 个核心参数之一，但通常不需要改）
 CROP_MODE: str = "start"             # "start" 或 "center"
+
+# ================== [NEW] 模型结构选择（本次重点） ==================
+# 说明：
+#   - 你希望先尝试 Longformer 风格「局部窗口 + 少量全局 token」
+#   - 并配合「时间稀疏、空间（电极）相对稠密」的轴向建模
+#   - 因此这里新增一个模型开关：MODEL_VARIANT
+MODEL_VARIANT: str = "axial_longformer"   # "dstagnn" | "axial_longformer"
+
+# 仅在 MODEL_VARIANT="axial_longformer" 时生效
+LONGFORMER_WINDOW_SIZE: int = 4            # 时间局部窗口半径（左右各 4 个帧）
+LONGFORMER_GLOBAL_TOKENS: int = 1          # 每个电极的时间全局 token 数（建议 1）
+LONGFORMER_DROPOUT: float = 0.1
+LONGFORMER_FFN_MULT: int = 4
+
 
 
 # ================== 基础超参数（训练相关） ==================
@@ -502,14 +516,31 @@ def main():
     input_samples = int(round(INPUT_SECONDS * FS))
     t_frames = compute_t_frames(input_samples)
 
-    exp_tag = f"SDE{int(USE_SDE)}_8L{int(USE_8_LEADS)}_FB{int(USE_FILTERBANK)}_{int(INPUT_SECONDS)}s"
+    # ----------------- 实验标签（包含模型结构信息） -----------------
+    if MODEL_VARIANT.lower().strip() in ("axial_longformer", "axial", "longformer"):
+        exp_tag = (
+            f"AxLF_W{LONGFORMER_WINDOW_SIZE}_G{LONGFORMER_GLOBAL_TOKENS}"
+            f"_B{NB_BLOCK}_D{D_MODEL_ATTN}_H{N_HEADS_ATTN}"
+            f"_8L{int(USE_8_LEADS)}_FB{int(USE_FILTERBANK)}_{int(INPUT_SECONDS)}s"
+        )
+    else:
+        exp_tag = (
+            f"DSTAGNN_SDE{int(USE_SDE)}"
+            f"_B{NB_BLOCK}_D{D_MODEL_ATTN}_H{N_HEADS_ATTN}"
+            f"_8L{int(USE_8_LEADS)}_FB{int(USE_FILTERBANK)}_{int(INPUT_SECONDS)}s"
+        )
     feat_name = "FilterBank" if USE_FILTERBANK else "STFT"
 
     if rank == 0:
         print("=" * 70)
         print(f"使用设备: {device} | DDP={is_distributed} | world_size={world_size} | rank={rank}")
         print(f"[EXP] {exp_tag}")
-        print(f"  - USE_SDE={USE_SDE} (inject_to_gcn={SDE_INJECT_TO_GCN}, alpha={SDE_DYNAMIC_ALPHA})")
+        print(f"  - MODEL_VARIANT={MODEL_VARIANT}")
+        if MODEL_VARIANT.lower().strip() in ("axial_longformer", "axial", "longformer"):
+            print(f"  - AxialLongformer: window={LONGFORMER_WINDOW_SIZE}, global_tokens={LONGFORMER_GLOBAL_TOKENS}, dropout={LONGFORMER_DROPOUT}, ffn_mult={LONGFORMER_FFN_MULT}")
+            print("  - (提示) USE_SDE/SDE_* 在 axial_longformer 下不会生效，仅用于 DSTAGNN。")
+        else:
+            print(f"  - USE_SDE={USE_SDE} (inject_to_gcn={SDE_INJECT_TO_GCN}, alpha={SDE_DYNAMIC_ALPHA})")
         print(f"  - USE_8_LEADS={USE_8_LEADS} | NUM_CHANNELS={num_channels} | channels={channels_used}")
         print(f"  - USE_FILTERBANK={USE_FILTERBANK} | feature={feat_name} | bands={BANDS}")
         print(f"  - INPUT_SECONDS={INPUT_SECONDS} | input_samples={input_samples} | T_frames={t_frames}")
@@ -518,7 +549,7 @@ def main():
     # ----------------- 路径 -----------------
     script_dir = os.path.dirname(os.path.abspath(__file__))
     data_dir = os.path.join(script_dir, "dataLoad", "BCICIV_2a") + os.sep
-    save_root = os.path.join(script_dir, "eeg_bcic2a_dstagnn_ckpts")
+    save_root = os.path.join(script_dir, f"eeg_bcic2a_ckpts_{MODEL_VARIANT}")
     if rank == 0:
         os.makedirs(save_root, exist_ok=True)
 
@@ -597,6 +628,12 @@ def main():
         use_sde=USE_SDE,
         use_dynamic_spatial_for_gcn=(SDE_INJECT_TO_GCN if USE_SDE else False),
         dynamic_spatial_alpha=SDE_DYNAMIC_ALPHA,
+        # ===== [NEW] 选择模型变体：Axial Longformer / DSTAGNN =====
+        model_variant=MODEL_VARIANT,
+        longformer_window_size=LONGFORMER_WINDOW_SIZE,
+        longformer_num_global_tokens=LONGFORMER_GLOBAL_TOKENS,
+        longformer_dropout=LONGFORMER_DROPOUT,
+        longformer_ffn_mult=LONGFORMER_FFN_MULT,
     ).to(device)
 
     if is_distributed:
@@ -664,6 +701,12 @@ def main():
             use_sde=USE_SDE,
             use_dynamic_spatial_for_gcn=(SDE_INJECT_TO_GCN if USE_SDE else False),
             dynamic_spatial_alpha=SDE_DYNAMIC_ALPHA,
+        # ===== [NEW] 选择模型变体：Axial Longformer / DSTAGNN =====
+        model_variant=MODEL_VARIANT,
+        longformer_window_size=LONGFORMER_WINDOW_SIZE,
+        longformer_num_global_tokens=LONGFORMER_GLOBAL_TOKENS,
+        longformer_dropout=LONGFORMER_DROPOUT,
+        longformer_ffn_mult=LONGFORMER_FFN_MULT,
         ).to(device)
 
         final_model.load_state_dict(torch.load(best_model_path, map_location=device))
