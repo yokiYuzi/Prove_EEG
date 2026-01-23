@@ -31,8 +31,13 @@ from torch.utils.data import DataLoader, TensorDataset, DistributedSampler
 from sklearn.metrics import classification_report
 from sklearn.model_selection import StratifiedShuffleSplit
 
-from dataLoad.preprocess_reref import get_data  # [MOD] 使用带重参考的预处理
-from DSTAGNN_my1 import make_model
+# [MOD] 使用带重参考的预处理（兼容两种目录结构：dataLoad/ 或同级文件）
+try:
+    from dataLoad.preprocess_reref import get_data
+except ImportError:
+    from preprocess_reref import get_data
+from DSTAGNN_my1 import make_model  # 方案一：时间稀疏(窗口+全局)注意力
+
 
 
 # ================== [MOD] 重参考（rereference）开关 ==================
@@ -68,6 +73,18 @@ D_MODEL_ATTN = 32
 N_HEADS_ATTN = 2
 DSTAGNN_D_K_ATTN = 8
 DSTAGNN_D_V_ATTN = 8
+
+
+# ================== [NEW] 方案一：BigBird/Longformer 风格时间注意力（局部窗口 + 少量全局 token，时间稀疏） ==================
+# 说明：
+#   - full       : 原始全连接时间注意力（T×T）
+#   - bigbird/longformer : “局部窗口 + 少量全局 token/全局索引” 的稀疏时间注意力（不含随机边）
+# 建议：
+#   - 先从 small window + 1 个全局 token 开始
+TEMPORAL_ATTN_MODE: str = "bigbird"      # "full" / "bigbird" / "longformer"
+TEMPORAL_WINDOW_SIZE: int = 4            # 单侧窗口大小 w（上下文=2w+1）
+TEMPORAL_NUM_GLOBAL_TOKENS: int = 0      # 追加 learnable 全局 token 数量（0=不追加；建议先用 global_indices）
+TEMPORAL_GLOBAL_INDICES = [0]            # 指定原始序列中哪些 time index 作为全局 token，例如 [0]
 
 # SDE 相关（不是 4 个核心参数之一，但你可能会做更细粒度消融）
 SDE_INJECT_TO_GCN: bool = True           # SDE 的动态空间注意力是否混入 GCN 邻接权重
@@ -502,7 +519,8 @@ def main():
     input_samples = int(round(INPUT_SECONDS * FS))
     t_frames = compute_t_frames(input_samples)
 
-    exp_tag = f"SDE{int(USE_SDE)}_8L{int(USE_8_LEADS)}_FB{int(USE_FILTERBANK)}_{int(INPUT_SECONDS)}s"
+    exp_tag = f"SDE{int(USE_SDE)}_8L{int(USE_8_LEADS)}_FB{int(USE_FILTERBANK)}_{int(INPUT_SECONDS)}s_" \
+          f"TA{TEMPORAL_ATTN_MODE}_W{TEMPORAL_WINDOW_SIZE}_G{TEMPORAL_NUM_GLOBAL_TOKENS}"
     feat_name = "FilterBank" if USE_FILTERBANK else "STFT"
 
     if rank == 0:
@@ -513,6 +531,7 @@ def main():
         print(f"  - USE_8_LEADS={USE_8_LEADS} | NUM_CHANNELS={num_channels} | channels={channels_used}")
         print(f"  - USE_FILTERBANK={USE_FILTERBANK} | feature={feat_name} | bands={BANDS}")
         print(f"  - INPUT_SECONDS={INPUT_SECONDS} | input_samples={input_samples} | T_frames={t_frames}")
+        print(f"  - TEMPORAL_ATTN_MODE={TEMPORAL_ATTN_MODE} | window={TEMPORAL_WINDOW_SIZE} | global_tokens={TEMPORAL_NUM_GLOBAL_TOKENS} | global_indices={TEMPORAL_GLOBAL_INDICES}")
         print("=" * 70)
 
     # ----------------- 路径 -----------------
@@ -597,6 +616,11 @@ def main():
         use_sde=USE_SDE,
         use_dynamic_spatial_for_gcn=(SDE_INJECT_TO_GCN if USE_SDE else False),
         dynamic_spatial_alpha=SDE_DYNAMIC_ALPHA,
+        # ===== 方案一：Longformer 时间稀疏注意力 =====
+        temporal_attn_mode=TEMPORAL_ATTN_MODE,
+        temporal_window_size=TEMPORAL_WINDOW_SIZE,
+        temporal_global_indices=TEMPORAL_GLOBAL_INDICES,
+        temporal_num_global_tokens=TEMPORAL_NUM_GLOBAL_TOKENS,
     ).to(device)
 
     if is_distributed:
@@ -664,6 +688,11 @@ def main():
             use_sde=USE_SDE,
             use_dynamic_spatial_for_gcn=(SDE_INJECT_TO_GCN if USE_SDE else False),
             dynamic_spatial_alpha=SDE_DYNAMIC_ALPHA,
+            # ===== 方案一：Longformer 时间稀疏注意力 =====
+            temporal_attn_mode=TEMPORAL_ATTN_MODE,
+            temporal_window_size=TEMPORAL_WINDOW_SIZE,
+            temporal_global_indices=TEMPORAL_GLOBAL_INDICES,
+            temporal_num_global_tokens=TEMPORAL_NUM_GLOBAL_TOKENS,
         ).to(device)
 
         final_model.load_state_dict(torch.load(best_model_path, map_location=device))

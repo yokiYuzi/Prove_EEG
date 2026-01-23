@@ -38,13 +38,43 @@ class ScaledDotProductAttention(nn.Module): # 标准点积注意力（带V和sof
         self.d_k = d_k #
 
     def forward(self, Q, K, V, attn_mask, res_att): # 前向传播
-        scores = torch.matmul(Q, K.transpose(-1, -2)) / np.sqrt(self.d_k) + res_att  # 计算分数并加入残差注意力
+        # Q, K, V: (B, F, H, T, d)
+        scores = torch.matmul(Q, K.transpose(-1, -2)) / np.sqrt(self.d_k)  # (B,F,H,T,T)
+
+        # ---- [MOD] 更稳健的 residual attention 注入 ----
+        # 兼容:
+        #   - res_att = 0 / 标量
+        #   - res_att 与 scores 同形
+        #   - res_att 形状比 scores 小（例如加入全局 token 后 scores 变大）-> padding 到左上角
+        #   - res_att 形状比 scores 大 -> 截断到匹配大小
+        if res_att is not None:
+            if torch.is_tensor(res_att):
+                if res_att.numel() == 1:
+                    scores = scores + res_att
+                else:
+                    if (res_att.dim() == scores.dim()) and (res_att.shape[:-2] == scores.shape[:-2]):
+                        tq, tk = scores.shape[-2], scores.shape[-1]
+                        rq, rk = res_att.shape[-2], res_att.shape[-1]
+                        if (rq == tq) and (rk == tk):
+                            scores = scores + res_att
+                        elif (rq <= tq) and (rk <= tk):
+                            res_pad = scores.new_zeros(scores.shape)
+                            res_pad[..., :rq, :rk] = res_att
+                            scores = scores + res_pad
+                        else:
+                            scores = scores + res_att[..., :tq, :tk]
+                    # shape 不匹配则忽略（避免直接报错）
+            else:
+                # python number
+                scores = scores + res_att
+        # ---------------------------------------------
+
         if attn_mask is not None: # 应用掩码
-            scores.masked_fill_(attn_mask, -1e9) #
+            scores = scores.masked_fill(attn_mask, -1e9) #
+
         attn_weights = F.softmax(scores, dim=-1) # 计算注意力权重
         context = torch.matmul(attn_weights, V)  # 计算上下文向量
         return context, scores # 返回上下文和原始分数（softmax前，但已加res_att）
-
 
 class SMultiHeadAttention(nn.Module): # 空间多头注意力模块
     def __init__(self, DEVICE_unused, d_model, d_k ,d_v_unused, n_heads): # 初始化
@@ -385,23 +415,144 @@ class TemporalSeqExporter(nn.Module):
         return alpha * tat_n + (1 - alpha) * gtu_n
 
 
+from typing import Optional, Sequence
+
 class MultiHeadAttention(nn.Module): # 时间多头注意力模块
-    def __init__(self, DEVICE, d_model_nodes, d_k ,d_v, n_heads, num_of_d_features): # 初始化
+    """Temporal self-attention.
+
+    [MOD] 支持两种模式：
+      - full      : 原始全连接注意力（T×T）
+      - longformer/bigbird: 局部窗口 + 少量全局 token/全局索引（时间稀疏）
+                   （在时间维上做稀疏连接，空间维保持稠密/可控）
+    """
+    def __init__(
+        self,
+        DEVICE,
+        d_model_nodes,
+        d_k,
+        d_v,
+        n_heads,
+        num_of_d_features,
+        # ---- [MOD] Longformer-style parameters ----
+        attn_mode: str = "full",                  # "full" / "longformer" / "bigbird"
+        window_size: int = 4,                     # 单侧窗口大小 w（上下文长度=2w+1）
+        global_indices: Optional[Sequence[int]] = None,  # 指定原始序列中哪些 time index 作为“全局 token”
+        num_global_tokens: int = 0,               # 额外追加的“learnable 全局 token”数量（0=不追加）
+        global_token_init_std: float = 0.02,
+        cache_attn_mask: bool = True,
+    ): # 初始化
         super(MultiHeadAttention, self).__init__() #
         self.d_model_nodes = d_model_nodes # 节点维度 (N)
         self.d_k = d_k #
         self.d_v = d_v #
         self.n_heads = n_heads #
         self.num_of_d_features = num_of_d_features # 特征维度 (F)
+
         self.W_Q = nn.Linear(d_model_nodes, d_k * n_heads, bias=False) #
         self.W_K = nn.Linear(d_model_nodes, d_k * n_heads, bias=False) #
         self.W_V = nn.Linear(d_model_nodes, d_v * n_heads, bias=False) #
-        self.fc = nn.Linear(n_heads * d_v, d_model_nodes, bias=False) #
+        self.fc  = nn.Linear(n_heads * d_v, d_model_nodes, bias=False) #
+
         self.layer_norm = nn.LayerNorm(d_model_nodes).to(DEVICE) #
+
+        # ---- [MOD] Longformer-style config ----
+        self.attn_mode = str(attn_mode).lower().strip()
+        if self.attn_mode not in ("full", "longformer", "bigbird"):
+            raise ValueError(f"MultiHeadAttention.attn_mode 必须是 'full' / 'longformer' / 'bigbird'，但收到: {attn_mode}")
+
+        self.window_size = int(window_size)
+        if self.window_size < 0:
+            raise ValueError(f"window_size 不能为负数，但收到: {window_size}")
+
+        self.global_indices = list(global_indices) if global_indices is not None else []
+        self.num_global_tokens = int(num_global_tokens)
+        if self.num_global_tokens < 0:
+            raise ValueError(f"num_global_tokens 不能为负数，但收到: {num_global_tokens}")
+
+        # learnable global tokens（追加到时间维末尾）
+        if self.num_global_tokens > 0:
+            # shape: (1, 1, G, N)，在 forward 里 broadcast 到 (B, F, G, N)
+            self.global_tokens = nn.Parameter(
+                torch.randn(1, 1, self.num_global_tokens, d_model_nodes) * float(global_token_init_std)
+            )
+        else:
+            self.global_tokens = None
+
+        self.cache_attn_mask = bool(cache_attn_mask)
+        self._attn_mask_cache = {}  # key: (T, device_type, device_index) -> (1,1,1,T_ext,T_ext)
+
+    def _build_longformer_attn_mask(self, T_orig: int, device: torch.device) -> torch.Tensor:
+        """构造 Longformer 风格时间注意力掩码（True 表示该位置被 mask 掉，不能注意）。"""
+        key = (int(T_orig), device.type, device.index, self.window_size, tuple(sorted(set(self.global_indices))), self.num_global_tokens)
+        if self.cache_attn_mask and key in self._attn_mask_cache:
+            return self._attn_mask_cache[key]
+
+        T_orig = int(T_orig)
+        G = int(self.num_global_tokens)
+        T_ext = T_orig + G
+
+        # allowed: bool matrix (T_ext, T_ext)
+        allowed = torch.zeros((T_ext, T_ext), dtype=torch.bool, device=device)
+
+        # 1) 原始 token 之间：局部窗口
+        if T_orig > 0:
+            idx = torch.arange(T_orig, device=device)
+            dist = (idx[:, None] - idx[None, :]).abs()
+            allowed[:T_orig, :T_orig] = dist <= self.window_size
+
+        # 2) 原始序列里指定的全局 token（既可作为 query，也可作为 key）
+        gi = []
+        if len(self.global_indices) > 0 and T_orig > 0:
+            for t in self.global_indices:
+                if isinstance(t, (int, np.integer)):
+                    if 0 <= int(t) < T_orig:
+                        gi.append(int(t))
+            gi = sorted(set(gi))
+        if len(gi) > 0:
+            allowed[:, gi] = True   # 所有 query 都能 attend 到这些 global key
+            allowed[gi, :] = True   # 这些 global query 能 attend 到所有 key
+
+        # 3) 追加的 learnable 全局 token（末尾追加）：全连接（global）
+        if G > 0:
+            allowed[:, T_orig:] = True  # 所有 query 都能 attend 到这些 global key
+            allowed[T_orig:, :] = True  # 这些 global query 能 attend 到所有 key
+
+        # 转为 mask：True = 不允许注意
+        mask = ~allowed
+        # broadcast 到 (B,F,H,T_ext,T_ext)
+        mask = mask.unsqueeze(0).unsqueeze(0).unsqueeze(0)  # (1,1,1,T_ext,T_ext)
+
+        if self.cache_attn_mask:
+            self._attn_mask_cache[key] = mask
+        return mask
 
     def forward(self, input_Q, input_K, input_V, attn_mask, res_att): # 前向传播
         residual, batch_size = input_Q, input_Q.size(0) #
-        
+
+        # ---- [MOD] Longformer: 追加 learnable global tokens，并构造稀疏掩码 ----
+        if self.attn_mode in ("longformer", "bigbird"):
+            B, F, T, N = input_Q.shape
+            T_orig = T
+
+            # 追加 learnable global tokens 到时间维末尾
+            if (self.global_tokens is not None) and (self.num_global_tokens > 0):
+                global_tok = self.global_tokens.expand(B, F, self.num_global_tokens, N)  # (B,F,G,N)
+                input_Q = torch.cat([input_Q, global_tok], dim=2)
+                input_K = torch.cat([input_K, global_tok], dim=2)
+                input_V = torch.cat([input_V, global_tok], dim=2)
+                residual = torch.cat([residual, global_tok], dim=2)
+
+            # Longformer 掩码（时间稀疏 + 全局 token）
+            lf_mask = self._build_longformer_attn_mask(T_orig=T_orig, device=input_Q.device)  # (1,1,1,T_ext,T_ext)
+
+            # 如果外部还给了 mask，则做并集（更严格）
+            if attn_mask is not None:
+                # 期望 attn_mask 可 broadcast 到 (B,F,H,T_ext,T_ext)
+                attn_mask = attn_mask | lf_mask
+            else:
+                attn_mask = lf_mask
+        # ---------------------------------------------------------------------
+
         Q = self.W_Q(input_Q).view(batch_size, self.num_of_d_features, -1, self.n_heads, self.d_k).transpose(2, 3)
         K = self.W_K(input_K).view(batch_size, self.num_of_d_features, -1, self.n_heads, self.d_k).transpose(2, 3)
         V = self.W_V(input_V).view(batch_size, self.num_of_d_features, -1, self.n_heads, self.d_v).transpose(2, 3)
@@ -411,8 +562,18 @@ class MultiHeadAttention(nn.Module): # 时间多头注意力模块
         context = context.transpose(2, 3).reshape(batch_size, self.num_of_d_features, -1, self.n_heads * self.d_v) #
         output = self.fc(context)  #
 
-        return self.layer_norm(output + residual), res_attn_scores #
+        out = self.layer_norm(output + residual)
 
+        # ---- [MOD] Longformer: 去掉追加的 global tokens，保持 (B,F,T_orig,N) 输出不变 ----
+        if self.attn_mode in ("longformer", "bigbird") and (self.num_global_tokens > 0):
+            # output/residual 已经是扩展序列长度，这里裁剪回原始长度
+            out = out[:, :, :T_orig, :]
+            if torch.is_tensor(res_attn_scores) and res_attn_scores.dim() >= 2:
+                # res_attn_scores: (B,F,H,T_ext,T_ext) -> (B,F,H,T_orig,T_orig)
+                res_attn_scores = res_attn_scores[..., :T_orig, :T_orig]
+        # ---------------------------------------------------------------------
+
+        return out, res_attn_scores #
 
 class cheb_conv_withSAt(nn.Module): # 带空间注意力的切比雪夫图卷积
     def __init__(self, K_cheb, cheb_polynomials, in_channels, out_channels, num_of_vertices): # 初始化
@@ -549,7 +710,11 @@ class DSTAGNN_block(nn.Module): # DSTAGNN的核心块
                  num_of_vertices, num_of_timesteps_input,
                  d_model_for_spatial_attn, d_k_for_attn, d_v_for_attn, n_heads_for_attn,
                  use_sde: bool = True,
-                 use_dynamic_spatial_for_gcn: bool = True, dynamic_spatial_alpha: float = 0.5):
+                 use_dynamic_spatial_for_gcn: bool = True, dynamic_spatial_alpha: float = 0.5,
+                 temporal_attn_mode: str = "full",
+                 temporal_window_size: int = 4,
+                 temporal_global_indices: Optional[Sequence[int]] = None,
+                 temporal_num_global_tokens: int = 0):
         super(DSTAGNN_block, self).__init__()
 
         self.DEVICE = DEVICE
@@ -570,7 +735,18 @@ class DSTAGNN_block(nn.Module): # DSTAGNN的核心块
             self.dynamic_spatial_alpha = 1.0
 
         self.EmbedT = Embedding(num_of_timesteps_input, num_of_vertices, num_of_d_features_for_embedT, 'T')
-        self.TAt = MultiHeadAttention(DEVICE, num_of_vertices, d_k_for_attn, d_v_for_attn, n_heads_for_attn, num_of_d_features_for_embedT)
+        self.TAt = MultiHeadAttention(
+            DEVICE,
+            num_of_vertices,
+            d_k_for_attn,
+            d_v_for_attn,
+            n_heads_for_attn,
+            num_of_d_features_for_embedT,
+            attn_mode=temporal_attn_mode,
+            window_size=temporal_window_size,
+            global_indices=temporal_global_indices,
+            num_global_tokens=temporal_num_global_tokens,
+        )
         self.tat_output_proj = nn.Linear(num_of_d_features_for_embedT * num_of_timesteps_input, d_model_for_spatial_attn)
 
         self.EmbedS = Embedding(num_of_vertices, d_model_for_spatial_attn, d_model_for_spatial_attn, 'S')
@@ -693,7 +869,11 @@ class DSTAGNN_submodule(nn.Module):
                  output_memory=False, return_internal_states=False,
                  use_sde: bool = True,
                  use_dynamic_spatial_for_gcn: bool = True,
-                 dynamic_spatial_alpha: float = 0.5):
+                 dynamic_spatial_alpha: float = 0.5,
+                 temporal_attn_mode: str = "full",
+                 temporal_window_size: int = 4,
+                 temporal_global_indices: Optional[Sequence[int]] = None,
+                 temporal_num_global_tokens: int = 0):
         super(DSTAGNN_submodule, self).__init__()
 
         if output_memory:
@@ -728,7 +908,11 @@ class DSTAGNN_submodule(nn.Module):
                                                d_model_for_spatial_attn, d_k_for_attn, d_v_for_attn, n_heads_for_attn,
                                                use_sde=self.use_sde,
                                                use_dynamic_spatial_for_gcn=self.use_dynamic_spatial_for_gcn,
-                                               dynamic_spatial_alpha=self.dynamic_spatial_alpha))
+                                               dynamic_spatial_alpha=self.dynamic_spatial_alpha,
+                                               temporal_attn_mode=temporal_attn_mode,
+                                               temporal_window_size=temporal_window_size,
+                                               temporal_global_indices=temporal_global_indices,
+                                               temporal_num_global_tokens=temporal_num_global_tokens))
             current_num_of_d_for_embedT = nb_chev_filter
             current_in_channels_for_cheb = nb_chev_filter
             if current_time_strides_for_gtu > 0:
@@ -967,7 +1151,11 @@ def make_model(DEVICE, num_of_d_initial_feat, nb_block, initial_in_channels_cheb
                task_type='regression', num_classes=None, output_memory=False, return_internal_states=False,
                use_sde: bool = True,
                use_dynamic_spatial_for_gcn: bool = True,
-               dynamic_spatial_alpha: float = 0.5
+               dynamic_spatial_alpha: float = 0.5,
+               temporal_attn_mode: str = "full",
+               temporal_window_size: int = 4,
+               temporal_global_indices: Optional[Sequence[int]] = None,
+               temporal_num_global_tokens: int = 0
                ):
     if isinstance(adj_mx, np.ndarray):
         adj_mx_tensor = torch.from_numpy(adj_mx).float().to(DEVICE)
@@ -999,7 +1187,11 @@ def make_model(DEVICE, num_of_d_initial_feat, nb_block, initial_in_channels_cheb
                              return_internal_states=return_internal_states,
                              use_sde=use_sde,
                              use_dynamic_spatial_for_gcn=use_dynamic_spatial_for_gcn,
-                             dynamic_spatial_alpha=dynamic_spatial_alpha)
+                             dynamic_spatial_alpha=dynamic_spatial_alpha,
+                             temporal_attn_mode=temporal_attn_mode,
+                             temporal_window_size=temporal_window_size,
+                             temporal_global_indices=temporal_global_indices,
+                             temporal_num_global_tokens=temporal_num_global_tokens)
 
     for p in model.parameters():
         if p.dim() > 1:
