@@ -1,24 +1,34 @@
+# coding: utf-8
 """main_transformer_encoder_attn_avg.py
 
 Transformer 基础 Encoder 结构，用于在 BCICIV-2a (Session T -> Session E) 上验证
 “注意力平均化(Attention Averaging)”现象。
 
-你只需要保证以下文件同目录（或在 PYTHONPATH 中）：
+依赖：
   - preprocess.py  (提供 get_data)
   - LoadData.py    (preprocess 会 import 它)
 
-脚本输出：
+输出：
   1) Test accuracy
   2) Test macro-F1
   3) sklearn classification_report（test）
   4) 注意力平均化的定量证据（attention entropy / 与 uniform 的距离等）
   5) 保存 test 预测结果 CSV、以及每层每头的平均注意力矩阵 .npy
 
-运行示例：
+运行：
   python main_transformer_encoder_attn_avg.py --subject 1 --epochs 200 --batch_size 32
 
-注意：本脚本默认使用 preprocess.get_data 内部的 2s~6s (4s) 裁剪。
-你也可以用 --input_seconds 进一步裁剪到 2s 或 4s。
+数据路径说明（关键修复点）：
+  你的工程结构是：
+    Only_Encoder/dataLoad/
+      ├─ main_transformer_encoder_attn_avg.py
+      ├─ preprocess.py
+      ├─ LoadData.py
+      └─ BCICIV_2a/
+          ├─ s1/A01T.mat ...
+          └─ ...
+  因此默认数据目录应为 ./BCICIV_2a 而不是 ./dataLoad/BCICIV_2a。
+  本脚本会自动在多个候选位置寻找 BCICIV_2a 根目录，避免出现 dataLoad/dataLoad 的重复路径。
 """
 
 from __future__ import annotations
@@ -29,7 +39,7 @@ import math
 import random
 import argparse
 from dataclasses import asdict, dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 
@@ -78,7 +88,6 @@ def crop_time(X: np.ndarray, target_len: int, mode: str = "start") -> np.ndarray
     if T == target_len:
         return X
     if T < target_len:
-        # pad zeros at the end
         pad = target_len - T
         return np.pad(X, ((0, 0), (0, 0), (0, pad)), mode="constant")
 
@@ -98,7 +107,6 @@ def crop_time(X: np.ndarray, target_len: int, mode: str = "start") -> np.ndarray
 def _mha_supports_avg_flag() -> bool:
     """PyTorch 1.12+ supports average_attn_weights flag in MultiheadAttention forward."""
     import inspect
-
     sig = inspect.signature(nn.MultiheadAttention.forward)
     return "average_attn_weights" in sig.parameters
 
@@ -167,7 +175,6 @@ class EncoderLayerWithAttn(nn.Module):
                     average_attn_weights=False,
                 )
             else:
-                # Older PyTorch: no per-head weights
                 attn_out, attn_w = self.self_attn(
                     x,
                     x,
@@ -224,13 +231,9 @@ class EEGTransformerEncoderClassifier(nn.Module):
         self.d_model = int(d_model)
         self.use_cls_token = bool(use_cls_token)
 
-        # number of temporal patches
         self.n_patches = int(math.ceil(self.input_samples / self.patch_size))
-
-        # patch embedding: (C * patch_size) -> d_model
         self.patch_embed = nn.Linear(self.n_channels * self.patch_size, d_model)
 
-        # [CLS]
         if self.use_cls_token:
             self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
             seq_len = 1 + self.n_patches
@@ -238,7 +241,6 @@ class EEGTransformerEncoderClassifier(nn.Module):
             self.cls_token = None
             seq_len = self.n_patches
 
-        # positional embedding
         self.pos_embed = nn.Parameter(torch.zeros(1, seq_len, d_model))
         self.pos_drop = nn.Dropout(dropout)
 
@@ -263,7 +265,6 @@ class EEGTransformerEncoderClassifier(nn.Module):
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
         if self.cls_token is not None:
             nn.init.trunc_normal_(self.cls_token, std=0.02)
-        # patch_embed/head use default init or you can add more
 
     def _to_patches(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B,C,T) -> patches: (B, n_patches, C*patch_size)"""
@@ -271,7 +272,6 @@ class EEGTransformerEncoderClassifier(nn.Module):
         if C != self.n_channels:
             raise ValueError(f"Expected C={self.n_channels}, got {C}")
 
-        # pad T to multiple of patch_size
         total_len = self.n_patches * self.patch_size
         if T < total_len:
             pad = total_len - T
@@ -279,29 +279,18 @@ class EEGTransformerEncoderClassifier(nn.Module):
         elif T > total_len:
             x = x[:, :, :total_len]
 
-        # unfold: (B,C,n_patches,patch_size)
         patches = x.unfold(dimension=-1, size=self.patch_size, step=self.patch_size)
-        patches = patches.permute(0, 2, 1, 3).contiguous()  # (B,n_patches,C,patch)
+        patches = patches.permute(0, 2, 1, 3).contiguous()
         patches = patches.view(B, self.n_patches, C * self.patch_size)
         return patches
 
     def forward(self, x: torch.Tensor, return_attn: bool = False):
-        """Forward.
-
-        Args:
-            x: (B, C, T)
-            return_attn: if True, also return attention weights (list per layer)
-
-        Returns:
-            logits: (B, num_classes)
-            attn_list: list of attention weights per layer (or None)
-        """
-        patches = self._to_patches(x)  # (B, n_patches, C*patch)
-        tok = self.patch_embed(patches)  # (B, n_patches, D)
+        patches = self._to_patches(x)
+        tok = self.patch_embed(patches)
 
         if self.use_cls_token:
             cls = self.cls_token.expand(tok.size(0), -1, -1)
-            tok = torch.cat([cls, tok], dim=1)  # (B, 1+n_patches, D)
+            tok = torch.cat([cls, tok], dim=1)
 
         tok = tok + self.pos_embed
         tok = self.pos_drop(tok)
@@ -313,12 +302,7 @@ class EEGTransformerEncoderClassifier(nn.Module):
                 attn_all.append(attn_w)
 
         tok = self.norm(tok)
-
-        if self.use_cls_token:
-            feat = tok[:, 0]  # CLS
-        else:
-            feat = tok.mean(dim=1)
-
+        feat = tok[:, 0] if self.use_cls_token else tok.mean(dim=1)
         logits = self.head(feat)
         return logits, attn_all
 
@@ -326,7 +310,6 @@ class EEGTransformerEncoderClassifier(nn.Module):
 # -----------------------------------------------------------------------------
 # Training / evaluation
 # -----------------------------------------------------------------------------
-
 
 def to_device(batch, device):
     x, y = batch
@@ -362,7 +345,12 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict
     }
 
 
-def train_one_epoch(model: nn.Module, loader: DataLoader, optimizer: torch.optim.Optimizer, device: torch.device) -> float:
+def train_one_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> float:
     model.train()
     total_loss = 0.0
     n = 0
@@ -387,7 +375,6 @@ def train_one_epoch(model: nn.Module, loader: DataLoader, optimizer: torch.optim
 
 @dataclass
 class AttnAveragingStats:
-    # CLS attention distribution metrics
     mean_entropy: float
     mean_l2_to_uniform: float
     mean_kl_to_uniform: float
@@ -418,8 +405,6 @@ def collect_mean_attention(
         mean_attn: (num_layers, num_heads(or 1), L, L)
     """
     model.eval()
-    num_layers = len(model.layers)
-
     attn_sum = None
     count = 0
 
@@ -429,22 +414,18 @@ def collect_mean_attention(
         x, _ = to_device(batch, device)
         _, attn_list = model(x, return_attn=True)
 
-        # attn_list: list length num_layers
-        # each attn: (B,H,L,L) or (B,L,L)
         layer_attns = []
         for attn in attn_list:
             if attn is None:
                 raise RuntimeError("return_attn=True but got None attention")
             if attn.dim() == 3:
-                # (B,L,L) -> (B,1,L,L)
-                attn = attn.unsqueeze(1)
+                attn = attn.unsqueeze(1)  # (B,1,L,L)
             layer_attns.append(attn.detach().cpu().float().numpy())
 
-        # stack layers -> (num_layers,B,H,L,L)
-        stacked = np.stack(layer_attns, axis=0)
+        stacked = np.stack(layer_attns, axis=0)  # (Layers,B,H,L,L)
 
         if attn_sum is None:
-            attn_sum = stacked.sum(axis=1)  # sum over B -> (num_layers,H,L,L)
+            attn_sum = stacked.sum(axis=1)  # sum over B -> (Layers,H,L,L)
         else:
             attn_sum += stacked.sum(axis=1)
 
@@ -453,27 +434,17 @@ def collect_mean_attention(
     if attn_sum is None or count == 0:
         raise RuntimeError("No attention collected; check loader")
 
-    mean_attn = attn_sum / float(count)
-    return mean_attn
+    return attn_sum / float(count)
 
 
 def compute_attn_averaging_stats(mean_attn: np.ndarray, cls_index: int = 0) -> Dict:
-    """Compute attention-averaging statistics from mean attention.
-
-    We focus on distribution of CLS query over all keys.
-
-    Args:
-        mean_attn: (LAYER, HEAD, L, L)
-        cls_index: index of CLS token (0 if use_cls_token=True)
-
-    Returns:
-        dict with per-layer stats + global average.
-    """
+    """Compute attention-averaging statistics from mean attention (focus CLS query)."""
     if mean_attn.ndim != 4:
         raise ValueError(f"mean_attn must be 4D (layer,head,L,L), got {mean_attn.shape}")
 
     num_layers, num_heads, L, L2 = mean_attn.shape
-    assert L == L2
+    if L != L2:
+        raise ValueError(f"mean_attn last two dims must be equal, got {L} vs {L2}")
 
     uniform = np.ones((L,), dtype=np.float64) / float(L)
 
@@ -482,9 +453,7 @@ def compute_attn_averaging_stats(mean_attn: np.ndarray, cls_index: int = 0) -> D
         ent_list, l2_list, kl_list, max_list = [], [], [], []
         for hi in range(num_heads):
             p = mean_attn[li, hi, cls_index, :].astype(np.float64)
-            # ensure normalized (just in case numerical issue)
             p = p / max(1e-12, p.sum())
-
             ent_list.append(_entropy(p))
             l2_list.append(float(np.sqrt(((p - uniform) ** 2).mean())))
             kl_list.append(_kl(p, uniform))
@@ -510,9 +479,7 @@ def compute_attn_averaging_stats(mean_attn: np.ndarray, cls_index: int = 0) -> D
     return {
         "per_layer": per_layer,
         "global": asdict(global_stats),
-        "note": (
-            "若注意力趋向平均化，则：entropy 接近 log(L)、l2_to_uniform/kl_to_uniform 接近 0、max_weight 接近 1/L。"
-        ),
+        "note": "若注意力趋向平均化：entropy 接近 log(L)、l2/kl 接近 0、max_weight 接近 1/L。",
         "L": int(L),
         "num_layers": int(num_layers),
         "num_heads": int(num_heads),
@@ -520,9 +487,62 @@ def compute_attn_averaging_stats(mean_attn: np.ndarray, cls_index: int = 0) -> D
 
 
 # -----------------------------------------------------------------------------
-# Main
+# Path resolving (核心修复点)
 # -----------------------------------------------------------------------------
 
+def resolve_bcic2a_root(user_data_dir: Optional[str]) -> str:
+    """Resolve BCICIV_2a root directory robustly.
+
+    Return: absolute path to directory that contains s1/, s2/, ... and description.pdf.
+    """
+    # 1) user specified
+    if user_data_dir is not None and str(user_data_dir).strip() != "":
+        p = os.path.abspath(os.path.expanduser(user_data_dir))
+
+        # If user points to parent dir containing BCICIV_2a/
+        if os.path.isdir(os.path.join(p, "BCICIV_2a")) and os.path.isdir(os.path.join(p, "BCICIV_2a", "s1")):
+            p = os.path.join(p, "BCICIV_2a")
+
+        if not os.path.isdir(p):
+            raise FileNotFoundError(
+                f"--data_dir 指向的路径不存在或不是目录: {p}\n"
+                "请传入形如: /path/to/BCICIV_2a （里面包含 s1/..s9/）"
+            )
+
+        if not os.path.isdir(os.path.join(p, "s1")):
+            raise FileNotFoundError(
+                f"--data_dir={p} 不是 BCICIV_2a 根目录（里面未找到 s1/）。\n"
+                "请传入包含 s1/..s9/ 的 BCICIV_2a 目录。"
+            )
+
+        return p
+
+    # 2) auto-detect
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    cwd = os.getcwd()
+
+    candidates = [
+        os.path.join(script_dir, "BCICIV_2a"),
+        os.path.join(script_dir, "dataLoad", "BCICIV_2a"),
+        os.path.join(cwd, "BCICIV_2a"),
+        os.path.join(cwd, "dataLoad", "BCICIV_2a"),
+    ]
+    for cand in candidates:
+        if os.path.isdir(cand) and os.path.isdir(os.path.join(cand, "s1")):
+            return os.path.abspath(cand)
+
+    tried = "\n".join([f"  - {os.path.abspath(x)}" for x in candidates])
+    raise FileNotFoundError(
+        "未能自动定位 BCICIV_2a 数据目录。已尝试：\n"
+        f"{tried}\n\n"
+        "请显式指定：\n"
+        "  python main_transformer_encoder_attn_avg.py --data_dir ./BCICIV_2a --subject 1\n"
+    )
+
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
 
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
@@ -531,28 +551,25 @@ def build_argparser() -> argparse.ArgumentParser:
         "--data_dir",
         type=str,
         default=None,
-        help="BCICIV_2a root dir (contains s1/, s2/, ...). Default: ./dataLoad/BCICIV_2a",
+        help="BCICIV_2a 根目录（里面应包含 s1/, s2/, ...）。不传则自动寻找（优先 ./BCICIV_2a）。",
     )
     p.add_argument("--seed", type=int, default=42)
 
-    # train
     p.add_argument("--epochs", type=int, default=200)
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight_decay", type=float, default=1e-2)
     p.add_argument("--val_ratio", type=float, default=0.1)
 
-    # input
     p.add_argument(
         "--input_seconds",
         type=float,
         default=4.0,
-        help="Further crop length in seconds (<=4.0). preprocess.get_data already crops 2s~6s (4s).",
+        help="进一步裁剪长度(秒)。preprocess.get_data 已默认裁剪 2s~6s(4s)，一般保持 4.0。",
     )
     p.add_argument("--fs", type=int, default=250)
     p.add_argument("--crop_mode", type=str, default="start", choices=["start", "center"])
 
-    # transformer
     p.add_argument("--patch_size", type=int, default=25, help="Temporal patch size in samples")
     p.add_argument("--d_model", type=int, default=128)
     p.add_argument("--nhead", type=int, default=8)
@@ -560,7 +577,6 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--dim_feedforward", type=int, default=256)
     p.add_argument("--dropout", type=float, default=0.1)
 
-    # standardization
     p.add_argument(
         "--standardize_mode",
         type=str,
@@ -568,15 +584,7 @@ def build_argparser() -> argparse.ArgumentParser:
         choices=["channel_global", "trial", "timepoint_across_trials"],
     )
 
-    # attention analysis
-    p.add_argument(
-        "--attn_max_batches",
-        type=int,
-        default=20,
-        help="Use how many batches from TEST to compute mean attention (for analysis)",
-    )
-
-    # output
+    p.add_argument("--attn_max_batches", type=int, default=20)
     p.add_argument("--out_dir", type=str, default="./outputs_transformer_encoder")
 
     return p
@@ -588,18 +596,39 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    data_dir = args.data_dir
-    if data_dir is None:
-        data_dir = os.path.join(script_dir, "dataLoad", "BCICIV_2a")
+    # ======= [FIX] robust data dir resolving =======
+    data_root = resolve_bcic2a_root(args.data_dir)
+    if not data_root.endswith(os.sep):
+        data_root = data_root + os.sep
 
-    # Make sure ends with os.sep because preprocess.get_data will append 's{}/'
-    if not data_dir.endswith(os.sep):
-        data_dir = data_dir + os.sep
+    # Fail-fast sanity check for mat files
+    sub_dir = os.path.join(data_root, f"s{args.subject}")
+    expected_train_mat = os.path.join(sub_dir, f"A0{args.subject}T.mat")
+    expected_test_mat = os.path.join(sub_dir, f"A0{args.subject}E.mat")
+    if not os.path.isdir(sub_dir):
+        raise FileNotFoundError(f"找不到目录: {sub_dir} (data_root={data_root})")
+    if not (os.path.exists(expected_train_mat) and os.path.exists(expected_test_mat)):
+        try:
+            listing = sorted(os.listdir(sub_dir))[:50]
+        except Exception:
+            listing = []
+        raise FileNotFoundError(
+            "未找到预期 .mat 文件：\n"
+            f"  - {expected_train_mat}\n"
+            f"  - {expected_test_mat}\n"
+            f"当前 {sub_dir} 目录前 50 项: {listing}\n"
+        )
 
-    # 1) load data (official protocol)
+    print("=" * 80)
+    print(f"[Path] data_root: {data_root}")
+    print(f"[Path] subject_dir: {sub_dir}")
+    print(f"[Path] train_mat: {expected_train_mat}")
+    print(f"[Path] test_mat : {expected_test_mat}")
+    print("=" * 80)
+
+    # 1) load data (official protocol): preprocess.get_data will append 's{subject}/'
     X_train, y_train, X_test, y_test, _, _ = get_data(
-        path=data_dir,
+        path=data_root,
         subject=args.subject,
         LOSO=False,
         data_type="2a",
@@ -618,15 +647,24 @@ def main() -> None:
     X_train = crop_time(X_train, target_len=target_len, mode=args.crop_mode)
     X_test = crop_time(X_test, target_len=target_len, mode=args.crop_mode)
 
-    n_trials, n_channels, _ = X_train.shape
+    _, n_channels, _ = X_train.shape
 
     # 3) split val from Session T
     sss = StratifiedShuffleSplit(n_splits=1, test_size=args.val_ratio, random_state=args.seed)
     train_idx, val_idx = next(sss.split(X_train, y_train))
 
-    train_ds = TensorDataset(torch.tensor(X_train[train_idx], dtype=torch.float32), torch.tensor(y_train[train_idx], dtype=torch.long))
-    val_ds = TensorDataset(torch.tensor(X_train[val_idx], dtype=torch.float32), torch.tensor(y_train[val_idx], dtype=torch.long))
-    test_ds = TensorDataset(torch.tensor(X_test, dtype=torch.float32), torch.tensor(y_test, dtype=torch.long))
+    train_ds = TensorDataset(
+        torch.tensor(X_train[train_idx], dtype=torch.float32),
+        torch.tensor(y_train[train_idx], dtype=torch.long),
+    )
+    val_ds = TensorDataset(
+        torch.tensor(X_train[val_idx], dtype=torch.float32),
+        torch.tensor(y_train[val_idx], dtype=torch.long),
+    )
+    test_ds = TensorDataset(
+        torch.tensor(X_test, dtype=torch.float32),
+        torch.tensor(y_test, dtype=torch.long),
+    )
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
@@ -658,7 +696,6 @@ def main() -> None:
 
     print("=" * 80)
     print(f"Device: {device}")
-    print(f"Data dir: {data_dir}")
     print(f"Subject: {args.subject}")
     print(f"Train/Val/Test: {len(train_ds)}/{len(val_ds)}/{len(test_ds)}")
     print(f"Input: C={n_channels}, T={target_len} ({args.input_seconds}s), patch={args.patch_size}, n_patches={model.n_patches}")
@@ -687,7 +724,6 @@ def main() -> None:
     model.load_state_dict(torch.load(ckpt_path, map_location=device))
     test_metrics = evaluate(model, test_loader, device)
 
-    # classification_report string
     report_str = classification_report(
         test_metrics["y_true"],
         test_metrics["y_pred"],
@@ -721,7 +757,6 @@ def main() -> None:
     with open(attn_stats_path, "w", encoding="utf-8") as f:
         json.dump(stats, f, ensure_ascii=False, indent=2)
 
-    # Console summary
     print("\n[ATTENTION AVERAGING EVIDENCE] (CLS attention on test)")
     print(f"Saved mean attention: {attn_npy_path}")
     print(f"Saved stats JSON    : {attn_stats_path}")
