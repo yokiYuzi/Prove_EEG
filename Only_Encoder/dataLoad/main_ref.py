@@ -20,7 +20,7 @@ Transformer 基础 Encoder 结构，用于在 BCICIV-2a (Session T -> Session E)
   5) 保存 test 预测结果 CSV、以及每层每头的平均注意力矩阵 .npy
 
 运行示例：
-  python main_transformer_encoder_attn_avg.py --subject 1 --epochs 200 --batch_size 32 --reref 1 --ref_channel Cz --drop_ref 0
+  python main_ref.py --subject 1 --epochs 200 --batch_size 32 --reref 1 --ref_channel Cz --drop_ref 0
 
 数据路径说明（自动处理 dataLoad/dataLoad 重复路径问题）：
   你的工程结构常见为：

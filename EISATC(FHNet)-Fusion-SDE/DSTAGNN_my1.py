@@ -549,7 +549,13 @@ class DSTAGNN_block(nn.Module): # DSTAGNN的核心块
                  num_of_vertices, num_of_timesteps_input,
                  d_model_for_spatial_attn, d_k_for_attn, d_v_for_attn, n_heads_for_attn,
                  use_sde: bool = True,
-                 use_dynamic_spatial_for_gcn: bool = True, dynamic_spatial_alpha: float = 0.5):
+                 use_dynamic_spatial_for_gcn: bool = True, dynamic_spatial_alpha: float = 0.5,
+                 # ===== [NEW] Lead-Gated Attention (方案1) =====
+                 use_lead_gating: bool = True,
+                 lead_gate_beta: float = 1.5,
+                 lead_gate_gamma: float = 0.0,
+                 lead_gate_temperature: float = 1.0,
+                 lead_gate_hidden: int = 32):
         super(DSTAGNN_block, self).__init__()
 
         self.DEVICE = DEVICE
@@ -568,6 +574,32 @@ class DSTAGNN_block(nn.Module): # DSTAGNN的核心块
             self.dynamic_spatial_alpha = 0.0
         elif self.dynamic_spatial_alpha > 1.0:
             self.dynamic_spatial_alpha = 1.0
+
+        # === [新增] Lead-Gated Attention（方案1）
+        # 目标：在空间注意力 logits 的 softmax 之前，引入每个导联的重要性先验 g，
+        #      从而缓解“导联过多且相似 -> 注意力平均化”的问题。
+        #
+        # g 的计算：g = softmax(MLP(x_TAt_projected))，其中 x_TAt_projected 是每个导联的摘要表示 (B,N,D)。
+        # logits 偏置：score(i→j) += beta * log(g_j)
+        # 可选边权门控：score(i→j) += gamma * (g_i * g_j)
+        self.use_lead_gating = bool(use_lead_gating)
+        self.lead_gate_beta = float(lead_gate_beta)
+        self.lead_gate_gamma = float(lead_gate_gamma)
+        self.lead_gate_temperature = float(lead_gate_temperature) if lead_gate_temperature is not None else 1.0
+        self.lead_gate_eps = 1e-8
+
+        if self.use_lead_gating:
+            hidden = int(lead_gate_hidden)
+            if hidden < 4:
+                hidden = 4
+            self.lead_gate_mlp = nn.Sequential(
+                nn.LayerNorm(d_model_for_spatial_attn),
+                nn.Linear(d_model_for_spatial_attn, hidden),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden, 1)
+            )
+        else:
+            self.lead_gate_mlp = None
 
         self.EmbedT = Embedding(num_of_timesteps_input, num_of_vertices, num_of_d_features_for_embedT, 'T')
         self.TAt = MultiHeadAttention(DEVICE, num_of_vertices, d_k_for_attn, d_v_for_attn, n_heads_for_attn, num_of_d_features_for_embedT)
@@ -632,13 +664,46 @@ class DSTAGNN_block(nn.Module): # DSTAGNN的核心块
         # === 原有静态 SAt ===
         tat_permuted = TATout.permute(0,3,1,2) # (B,N,F,T)
         x_TAt_projected = self.tat_output_proj(tat_permuted.reshape(batch_size, num_of_vertices, -1))
-        
+
+        # === [新增] Lead-Gated Attention：从每个 trial 的导联摘要表示中估计导联重要性 g ===
+        lead_gate_scores = None
+        lead_gate_g = None
+        lead_gate_logg = None
+        if self.use_lead_gating and (self.lead_gate_mlp is not None):
+            # (B,N,D) -> (B,N)
+            lead_gate_scores = self.lead_gate_mlp(x_TAt_projected).squeeze(-1)
+            temp = self.lead_gate_temperature if self.lead_gate_temperature > 0 else 1.0
+            lead_gate_g = F.softmax(lead_gate_scores / temp, dim=1)            # (B,N), sum=1
+            lead_gate_logg = torch.log(lead_gate_g + self.lead_gate_eps)       # (B,N)
+        else:
+            lead_gate_scores = None
+            lead_gate_g = None
+            lead_gate_logg = None
+
         SEmx_TAt = self.EmbedS(x_TAt_projected, batch_size)
         SEmx_TAt_dropped = self.dropout(SEmx_TAt)
         sat_scores_static = self.SAt(SEmx_TAt_dropped, SEmx_TAt_dropped, attn_mask=None) # (B,K,N,N) [静态 logits]
 
+        # === [新增] 在 softmax 前，用 g 对空间注意力 logits 加偏置（static + dynamic） ===
+        if lead_gate_logg is not None:
+            # key-bias: score(i->j) += beta * log(g_j)
+            key_bias_static = self.lead_gate_beta * lead_gate_logg[:, None, None, :]    # (B,1,1,N) -> broadcast to (B,K,N,N)
+            sat_scores_static = sat_scores_static + key_bias_static
+
+            if sat_scores_seq is not None:
+                key_bias_seq = self.lead_gate_beta * lead_gate_logg[:, None, None, None, :]  # (B,1,1,1,N) -> (B,T,K,N,N)
+                sat_scores_seq = sat_scores_seq + key_bias_seq
+
+            # optional edge gating: score(i->j) += gamma * (g_i * g_j)
+            if self.lead_gate_gamma != 0.0 and (lead_gate_g is not None):
+                edge_gate = (lead_gate_g[:, :, None] * lead_gate_g[:, None, :])  # (B,N,N)
+                sat_scores_static = sat_scores_static + self.lead_gate_gamma * edge_gate[:, None, :, :]
+                if sat_scores_seq is not None:
+                    sat_scores_seq = sat_scores_seq + self.lead_gate_gamma * edge_gate[:, None, None, :, :]
+
         # === [增强] 将动态 sat_scores_seq 注入 GCN 的邻接权重（可选） ===
         if self.use_dynamic_spatial_for_gcn:
+            # 注意：这里用的是“已经做过 lead-gate 偏置”的 sat_scores_seq
             sat_dyn_avg = sat_scores_seq.mean(dim=1)  # (B,K,N,N) —— 动态 logits 的时间平均
             alpha = self.dynamic_spatial_alpha
             sat_scores_for_gcn = (1.0 - alpha) * sat_scores_static + alpha * sat_dyn_avg
@@ -676,6 +741,8 @@ class DSTAGNN_block(nn.Module): # DSTAGNN的核心块
             "sat_scores_for_gcn": sat_scores_for_gcn.detach(),               # 实际用于GCN的 logits（静态或静态+动态混合）
             "sat_scores_dyn_avg": (sat_dyn_avg.detach() if sat_dyn_avg is not None else torch.zeros_like(sat_scores_static.detach())),
             "sat_scores_seq": sat_scores_seq,                                # 动态序列 logits（保留梯度，供 SDEHead 使用）
+            "lead_gate_scores": (lead_gate_scores.detach() if lead_gate_scores is not None else torch.zeros((batch_size, num_of_vertices), device=x.device)),
+            "lead_gate_g": (lead_gate_g.detach() if lead_gate_g is not None else torch.zeros((batch_size, num_of_vertices), device=x.device)),
             "gate_weights_gtu3": gate3_weights.detach(),
             "gate_weights_gtu5": gate5_weights.detach(),
             "gate_weights_gtu7": gate7_weights.detach()
@@ -693,7 +760,13 @@ class DSTAGNN_submodule(nn.Module):
                  output_memory=False, return_internal_states=False,
                  use_sde: bool = True,
                  use_dynamic_spatial_for_gcn: bool = True,
-                 dynamic_spatial_alpha: float = 0.5):
+                 dynamic_spatial_alpha: float = 0.5,
+                 # ===== [NEW] Lead-Gated Attention (方案1) =====
+                 use_lead_gating: bool = True,
+                 lead_gate_beta: float = 1.5,
+                 lead_gate_gamma: float = 0.0,
+                 lead_gate_temperature: float = 1.0,
+                 lead_gate_hidden: int = 32):
         super(DSTAGNN_submodule, self).__init__()
 
         if output_memory:
@@ -713,6 +786,13 @@ class DSTAGNN_submodule(nn.Module):
         self.use_dynamic_spatial_for_gcn = bool(use_dynamic_spatial_for_gcn)
         self.dynamic_spatial_alpha = float(dynamic_spatial_alpha)
 
+        # ===== [NEW] Lead-Gated Attention (方案1) =====
+        self.use_lead_gating = bool(use_lead_gating)
+        self.lead_gate_beta = float(lead_gate_beta)
+        self.lead_gate_gamma = float(lead_gate_gamma)
+        self.lead_gate_temperature = float(lead_gate_temperature) if lead_gate_temperature is not None else 1.0
+        self.lead_gate_hidden = int(lead_gate_hidden)
+
 
         self.BlockList = nn.ModuleList()
         current_num_of_d_for_embedT = num_of_d_initial_feat
@@ -728,7 +808,12 @@ class DSTAGNN_submodule(nn.Module):
                                                d_model_for_spatial_attn, d_k_for_attn, d_v_for_attn, n_heads_for_attn,
                                                use_sde=self.use_sde,
                                                use_dynamic_spatial_for_gcn=self.use_dynamic_spatial_for_gcn,
-                                               dynamic_spatial_alpha=self.dynamic_spatial_alpha))
+                                               dynamic_spatial_alpha=self.dynamic_spatial_alpha,
+                                               use_lead_gating=self.use_lead_gating,
+                                               lead_gate_beta=self.lead_gate_beta,
+                                               lead_gate_gamma=self.lead_gate_gamma,
+                                               lead_gate_temperature=self.lead_gate_temperature,
+                                               lead_gate_hidden=self.lead_gate_hidden))
             current_num_of_d_for_embedT = nb_chev_filter
             current_in_channels_for_cheb = nb_chev_filter
             if current_time_strides_for_gtu > 0:
@@ -868,7 +953,8 @@ class DSTAGNN_submodule(nn.Module):
                 "meta": {"T": T, "N": N}
             }
 
-    def forward(self, x):
+    def forward(self, x, return_internal_states: bool = None):
+        do_return_internal_states = self.return_internal_states if return_internal_states is None else bool(return_internal_states)
         block_outputs_concat_time = []
         res_att_prev = 0
         all_blocks_internal_states = []
@@ -878,7 +964,7 @@ class DSTAGNN_submodule(nn.Module):
         for i, block in enumerate(self.BlockList):
             block_output, res_att_current, current_block_internal_states = block(current_x_for_block, res_att_prev)
             block_outputs_concat_time.append(block_output)
-            if self.return_internal_states:
+            if do_return_internal_states:
                 all_blocks_internal_states.append(current_block_internal_states)
             res_att_prev = res_att_current
             current_x_for_block = block_output
@@ -954,7 +1040,7 @@ class DSTAGNN_submodule(nn.Module):
             output1_permuted = output1.permute(0,2,1)
             output = self.final_prediction_fc(output1_permuted)
 
-        if self.return_internal_states:
+        if do_return_internal_states:
             return output, all_blocks_internal_states
         else:
             return output
@@ -967,7 +1053,13 @@ def make_model(DEVICE, num_of_d_initial_feat, nb_block, initial_in_channels_cheb
                task_type='regression', num_classes=None, output_memory=False, return_internal_states=False,
                use_sde: bool = True,
                use_dynamic_spatial_for_gcn: bool = True,
-               dynamic_spatial_alpha: float = 0.5
+               dynamic_spatial_alpha: float = 0.5,
+               # ===== [NEW] Lead-Gated Attention (方案1) =====
+               use_lead_gating: bool = True,
+               lead_gate_beta: float = 1.5,
+               lead_gate_gamma: float = 0.0,
+               lead_gate_temperature: float = 1.0,
+               lead_gate_hidden: int = 32
                ):
     if isinstance(adj_mx, np.ndarray):
         adj_mx_tensor = torch.from_numpy(adj_mx).float().to(DEVICE)
@@ -999,7 +1091,12 @@ def make_model(DEVICE, num_of_d_initial_feat, nb_block, initial_in_channels_cheb
                              return_internal_states=return_internal_states,
                              use_sde=use_sde,
                              use_dynamic_spatial_for_gcn=use_dynamic_spatial_for_gcn,
-                             dynamic_spatial_alpha=dynamic_spatial_alpha)
+                             dynamic_spatial_alpha=dynamic_spatial_alpha,
+                             use_lead_gating=use_lead_gating,
+                             lead_gate_beta=lead_gate_beta,
+                             lead_gate_gamma=lead_gate_gamma,
+                             lead_gate_temperature=lead_gate_temperature,
+                             lead_gate_hidden=lead_gate_hidden)
 
     for p in model.parameters():
         if p.dim() > 1:

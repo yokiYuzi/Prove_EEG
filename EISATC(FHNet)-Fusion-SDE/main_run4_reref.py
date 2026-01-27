@@ -18,6 +18,7 @@
 
 import os
 import numpy as np
+import math
 from datetime import timedelta
 
 import torch
@@ -30,6 +31,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, TensorDataset, DistributedSampler
 from sklearn.metrics import classification_report
 from sklearn.model_selection import StratifiedShuffleSplit
+
+from dataclasses import dataclass, asdict
+from typing import Dict, Any, Optional, Tuple
 
 from dataLoad.preprocess_reref import get_data  # [MOD] 使用带重参考的预处理
 from DSTAGNN_my1 import make_model
@@ -47,6 +51,21 @@ USE_SDE: bool = True                 # 1) 是否使用 SDE（动态空间注意�
 USE_8_LEADS: bool = False            # 2) 是否使用 8 导联（缩减版）
 USE_FILTERBANK: bool = True         # 3) 是否使用滤波器组分离频带（False=STFT频带功率）
 INPUT_SECONDS: float = 4.0           # 4) 输入长度（2.0 或 4.0）
+
+# ================== Lead-Gated Attention（方案1） ==================
+# 目的：在空间注意力 logits 的 softmax 前加入“导联重要性先验 g”，缓解注意力平均化
+USE_LEAD_GATING: bool = True          # 是否启用导联门控（建议保持 True）
+LEAD_GATE_BETA: float = 1.5          # key-bias 强度：score(i->j) += beta * log(g_j)
+LEAD_GATE_GAMMA: float = 0.0         # 可选边门控：score(i->j) += gamma * (g_i * g_j)
+LEAD_GATE_TEMPERATURE: float = 1.0   # g 的 softmax 温度（<1 更尖锐，>1 更平滑）
+LEAD_GATE_HIDDEN: int = 32           # 门控 MLP 隐层宽度
+
+# ================== 注意力平均化(Attention Averaging) 监控打印 ==================
+# 说明：
+#   - 若注意力趋向平均化：entropy 接近 log(N)、l2/kl 接近 0、max_weight 接近 1/N
+PRINT_ATTN_AVG_STATS: bool = True
+ATTN_AVG_CHECK_EVERY: int = 10       # 每隔多少 epoch 打印一次（建议 5~20）
+ATTN_AVG_MAX_BATCHES: int = 10       # 统计时最多跑多少个 batch（越大越准，越慢）
 
 # 输入裁剪方式（不是 4 个核心参数之一，但通常不需要改）
 CROP_MODE: str = "start"             # "start" 或 "center"
@@ -478,6 +497,212 @@ def evaluate_eeg(model, loader, criterion, device, feat_extractor: EEGFeatureExt
 
 
 # ================== 主函数（官方协议版） ==================
+
+# -----------------------------------------------------------------------------
+# Attention averaging analysis (空间注意力平均化定量监控)
+# -----------------------------------------------------------------------------
+
+@dataclass
+class SpatialAttnAveragingStats:
+    mean_entropy: float
+    mean_l2_to_uniform: float
+    mean_kl_to_uniform: float
+    mean_max_weight: float
+
+
+def _entropy_torch(p: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    p = p.clamp(min=eps, max=1.0)
+    return -(p * torch.log(p)).sum(dim=-1)
+
+
+def _l2_to_uniform_torch(p: torch.Tensor) -> torch.Tensor:
+    # p: (..., N)
+    n = p.size(-1)
+    u = 1.0 / float(n)
+    return torch.sqrt(((p - u) ** 2).mean(dim=-1))
+
+
+def _kl_to_uniform_torch(p: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    # KL(p || uniform)
+    p = p.clamp(min=eps, max=1.0)
+    n = p.size(-1)
+    log_u = -math.log(float(n))
+    return (p * (torch.log(p) - log_u)).sum(dim=-1)
+
+
+@torch.no_grad()
+def collect_spatial_attention_stats(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    feat_extractor: "EEGFeatureExtractor",
+    max_batches: int = 10,
+) -> Dict[str, Any]:
+    """收集 DSTAGNN 空间注意力（实际用于 GCN 的归一化邻接权重）的“平均化”统计量。
+
+    统计对象：
+      A = softmax( sat_scores_for_gcn + adj_pa_static * mask_k )
+
+    若出现注意力平均化（更“均匀”）：
+      - entropy 接近 log(N)
+      - l2/kl_to_uniform 接近 0
+      - max_weight 接近 1/N
+    """
+    model.eval()
+
+    # unwrap DataParallel / DDP
+    base_model = model.module if isinstance(model, (DDP, nn.DataParallel)) else model
+
+    nb_block = getattr(base_model, "nb_block", None) or len(base_model.BlockList)
+    num_vertices = int(getattr(base_model, "num_of_vertices", base_model.BlockList[0].adj_pa_static.size(0)))
+    logN = math.log(float(num_vertices))
+    invN = 1.0 / float(num_vertices)
+
+    per_block = []
+
+    # accumulators for global stats
+    g_sum_entropy = 0.0
+    g_sum_l2 = 0.0
+    g_sum_kl = 0.0
+    g_sum_max = 0.0
+    g_count = 0
+
+    for bi in range(nb_block):
+        per_block.append(
+            {
+                "block": bi,
+                "per_head": [],
+                "mean": None,
+                "lead_g": None,
+            }
+        )
+
+    # Iterate batches (subset)
+    for batch_i, batch in enumerate(loader):
+        if batch_i >= max_batches:
+            break
+        inputs, _ = batch
+        inputs = inputs.to(device)  # (B, C, T)
+        x = feat_extractor(inputs)  # (B, C, N_BANDS, T_frames)
+
+        out = base_model(x, return_internal_states=True)
+        if not (isinstance(out, tuple) and len(out) == 2):
+            raise RuntimeError("collect_spatial_attention_stats 需要模型 forward 返回 (logits, internal_states)")
+        _, internal_states_list = out
+
+        for bi in range(nb_block):
+            st = internal_states_list[bi]
+            sat_logits = st["sat_scores_for_gcn"].to(device)  # (B,K,N,N)
+            B, K, N, N2 = sat_logits.shape
+            assert N == num_vertices and N2 == num_vertices
+
+            block = base_model.BlockList[bi]
+            adj = block.adj_pa_static.to(device)  # (N,N)
+
+            # lead gate stats (g)
+            lead_g = st.get("lead_gate_g", None)
+            if lead_g is not None and lead_g.numel() != 0:
+                g = lead_g.to(device).float()  # (B,N)
+                ent_g = _entropy_torch(g).mean().item()
+                l2_g = _l2_to_uniform_torch(g).mean().item()
+                kl_g = _kl_to_uniform_torch(g).mean().item()
+                max_g = g.max(dim=-1).values.mean().item()
+                per_block[bi]["lead_g"] = {
+                    "entropy": ent_g,
+                    "l2_to_uniform": l2_g,
+                    "kl_to_uniform": kl_g,
+                    "max_weight": max_g,
+                    "note": f"uniform: entropy~log(N)={logN:.3f}, max~1/N={invN:.3f}",
+                }
+
+            # per head stats for effective adjacency attention
+            head_stats = []
+            for k in range(K):
+                mask_k = block.cheb_conv_SAt.mask_per_k[k].to(device)  # (N,N)
+                combined = sat_logits[:, k, :, :] + (adj * mask_k).unsqueeze(0)  # (B,N,N)
+
+                A = torch.softmax(combined, dim=-1)  # (B,N,N) row-wise over keys
+                # Flatten rows: (B*N, N)
+                A_flat = A.reshape(-1, N)
+
+                ent = _entropy_torch(A_flat).mean().item()
+                l2u = _l2_to_uniform_torch(A_flat).mean().item()
+                klu = _kl_to_uniform_torch(A_flat).mean().item()
+                maxw = A_flat.max(dim=-1).values.mean().item()
+
+                head_stats.append(
+                    {
+                        "head": k,
+                        "entropy": ent,
+                        "l2_to_uniform": l2u,
+                        "kl_to_uniform": klu,
+                        "max_weight": maxw,
+                        "note": f"uniform: entropy~log(N)={logN:.3f}, max~1/N={invN:.3f}",
+                    }
+                )
+
+                # global accumulate
+                g_sum_entropy += ent
+                g_sum_l2 += l2u
+                g_sum_kl += klu
+                g_sum_max += maxw
+                g_count += 1
+
+            per_block[bi]["per_head"] = head_stats
+
+            # per block mean
+            ent_m = float(np.mean([h["entropy"] for h in head_stats]))
+            l2_m = float(np.mean([h["l2_to_uniform"] for h in head_stats]))
+            kl_m = float(np.mean([h["kl_to_uniform"] for h in head_stats]))
+            mx_m = float(np.mean([h["max_weight"] for h in head_stats]))
+            per_block[bi]["mean"] = asdict(
+                SpatialAttnAveragingStats(
+                    mean_entropy=ent_m,
+                    mean_l2_to_uniform=l2_m,
+                    mean_kl_to_uniform=kl_m,
+                    mean_max_weight=mx_m,
+                )
+            )
+
+    if g_count == 0:
+        raise RuntimeError("collect_spatial_attention_stats 未收集到任何 attention；请检查 loader")
+
+    global_stats = SpatialAttnAveragingStats(
+        mean_entropy=g_sum_entropy / float(g_count),
+        mean_l2_to_uniform=g_sum_l2 / float(g_count),
+        mean_kl_to_uniform=g_sum_kl / float(g_count),
+        mean_max_weight=g_sum_max / float(g_count),
+    )
+
+    return {
+        "global": asdict(global_stats),
+        "per_block": per_block,
+        "N": num_vertices,
+        "logN": logN,
+        "invN": invN,
+        "note": "若注意力平均化：entropy 接近 log(N)、l2/kl 接近 0、max_weight 接近 1/N。",
+    }
+
+
+def pretty_print_attn_stats(stats: Dict[str, Any], prefix: str = "") -> None:
+    g = stats["global"]
+    N = stats["N"]
+    logN = stats["logN"]
+    invN = stats["invN"]
+    print(f"{prefix}[AttnAvg] Global | N={N} logN={logN:.3f} 1/N={invN:.3f} | "
+          f"entropy={g['mean_entropy']:.4f} l2={g['mean_l2_to_uniform']:.4f} "
+          f"kl={g['mean_kl_to_uniform']:.4f} max={g['mean_max_weight']:.4f}")
+
+    for b in stats["per_block"]:
+        bm = b["mean"]
+        print(f"{prefix}  Block{b['block']} mean | "
+              f"entropy={bm['mean_entropy']:.4f} l2={bm['mean_l2_to_uniform']:.4f} "
+              f"kl={bm['mean_kl_to_uniform']:.4f} max={bm['mean_max_weight']:.4f}")
+        lg = b.get("lead_g", None)
+        if lg is not None:
+            print(f"{prefix}    lead-g | entropy={lg['entropy']:.4f} l2={lg['l2_to_uniform']:.4f} "
+                  f"kl={lg['kl_to_uniform']:.4f} max={lg['max_weight']:.4f}")
+
 def main():
     subject = 1   # 可改为循环 1~9
 
@@ -597,6 +822,11 @@ def main():
         use_sde=USE_SDE,
         use_dynamic_spatial_for_gcn=(SDE_INJECT_TO_GCN if USE_SDE else False),
         dynamic_spatial_alpha=SDE_DYNAMIC_ALPHA,
+        use_lead_gating=USE_LEAD_GATING,
+        lead_gate_beta=LEAD_GATE_BETA,
+        lead_gate_gamma=LEAD_GATE_GAMMA,
+        lead_gate_temperature=LEAD_GATE_TEMPERATURE,
+        lead_gate_hidden=LEAD_GATE_HIDDEN,
     ).to(device)
 
     if is_distributed:
@@ -633,6 +863,14 @@ def main():
                   f"Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} | "
                   f"Val Loss: {val_metrics['loss']:.4f} F1: {val_metrics['f1_macro']:.4f}")
 
+            if PRINT_ATTN_AVG_STATS and (epoch == 1 or epoch == N_EPOCHS or (epoch % ATTN_AVG_CHECK_EVERY == 0)):
+                try:
+                    attn_stats = collect_spatial_attention_stats(model_eval, val_loader, device, feat_extractor, max_batches=ATTN_AVG_MAX_BATCHES)
+                    pretty_print_attn_stats(attn_stats, prefix=f"[S{subject}][{exp_tag}] ")
+                except Exception as e:
+                    print(f"[S{subject}][{exp_tag}][AttnAvg] warning: {e}")
+
+
             if val_metrics["f1_macro"] > best_val_f1:
                 best_val_f1 = val_metrics["f1_macro"]
                 torch.save(model_eval.state_dict(), best_model_path)
@@ -664,10 +902,22 @@ def main():
             use_sde=USE_SDE,
             use_dynamic_spatial_for_gcn=(SDE_INJECT_TO_GCN if USE_SDE else False),
             dynamic_spatial_alpha=SDE_DYNAMIC_ALPHA,
+            use_lead_gating=USE_LEAD_GATING,
+            lead_gate_beta=LEAD_GATE_BETA,
+            lead_gate_gamma=LEAD_GATE_GAMMA,
+            lead_gate_temperature=LEAD_GATE_TEMPERATURE,
+            lead_gate_hidden=LEAD_GATE_HIDDEN,
         ).to(device)
 
         final_model.load_state_dict(torch.load(best_model_path, map_location=device))
         final_model.eval()
+
+        if PRINT_ATTN_AVG_STATS:
+            try:
+                attn_stats_test = collect_spatial_attention_stats(final_model, test_loader, device, feat_extractor, max_batches=ATTN_AVG_MAX_BATCHES)
+                pretty_print_attn_stats(attn_stats_test, prefix=f"[S{subject}][{exp_tag}][TEST] ")
+            except Exception as e:
+                print(f"[S{subject}][{exp_tag}][TEST][AttnAvg] warning: {e}")
 
         test_metrics = evaluate_eeg(final_model, test_loader, criterion, device, feat_extractor)
 
