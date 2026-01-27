@@ -531,7 +531,7 @@ def build_argparser() -> argparse.ArgumentParser:
         "--data_dir",
         type=str,
         default=None,
-        help="BCICIV_2a root dir (contains s1/, s2/, ...). Default: ./dataLoad/BCICIV_2a",
+        help="BCICIV_2a 根目录（里面应包含 s1/, s2/, ...）。不传则自动寻找：优先 ./BCICIV_2a，其次 ./dataLoad/BCICIV_2a。",
     )
     p.add_argument("--seed", type=int, default=42)
 
@@ -582,20 +582,98 @@ def build_argparser() -> argparse.ArgumentParser:
     return p
 
 
+
+
+def resolve_bcic2a_root(user_data_dir: Optional[str]) -> str:
+    """
+    Resolve BCICIV_2a root directory robustly.
+
+    Your folder layout may be either:
+      1) <this_dir>/BCICIV_2a/s1/...
+      2) <this_dir>/dataLoad/BCICIV_2a/s1/...
+      3) You pass --data_dir pointing to BCICIV_2a (or its parent).
+
+    This function auto-detects and returns an absolute path to BCICIV_2a root.
+    """
+    # 1) user specified
+    if user_data_dir is not None and str(user_data_dir).strip() != "":
+        p = os.path.abspath(os.path.expanduser(user_data_dir))
+
+        # If user points to parent dir containing BCICIV_2a/
+        if os.path.isdir(os.path.join(p, "BCICIV_2a")) and os.path.isdir(os.path.join(p, "BCICIV_2a", "s1")):
+            p = os.path.join(p, "BCICIV_2a")
+
+        if not os.path.isdir(p):
+            raise FileNotFoundError(
+                f"--data_dir 指向的路径不存在或不是目录: {p}\n"
+                f"请传入形如: /path/to/BCICIV_2a （里面包含 s1/..s9/）"
+            )
+        return p
+
+    # 2) auto detect
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    cwd = os.getcwd()
+
+    candidates = [
+        os.path.join(script_dir, "BCICIV_2a"),
+        os.path.join(script_dir, "dataLoad", "BCICIV_2a"),
+        os.path.join(cwd, "BCICIV_2a"),
+        os.path.join(cwd, "dataLoad", "BCICIV_2a"),
+    ]
+
+    for cand in candidates:
+        if os.path.isdir(cand) and os.path.isdir(os.path.join(cand, "s1")):
+            return os.path.abspath(cand)
+
+    # 3) last resort: keep a reasonable default, but raise a clearer error
+    tried = "\n".join([f"  - {os.path.abspath(x)}" for x in candidates])
+    raise FileNotFoundError(
+        "未能自动定位 BCICIV_2a 数据目录。已尝试以下候选路径：\n"
+        f"{tried}\n\n"
+        "请用参数显式指定，例如：\n"
+        "  python main_transformer_encoder_attn_avg.py --data_dir ./BCICIV_2a --subject 1\n"
+        "其中 ./BCICIV_2a 目录内应包含 s1/..s9/。"
+    )
+
+
 def main() -> None:
     args = build_argparser().parse_args()
     seed_everything(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    data_dir = args.data_dir
-    if data_dir is None:
-        data_dir = os.path.join(script_dir, "dataLoad", "BCICIV_2a")
+    data_dir = resolve_bcic2a_root(args.data_dir)
 
     # Make sure ends with os.sep because preprocess.get_data will append 's{}/'
     if not data_dir.endswith(os.sep):
         data_dir = data_dir + os.sep
+
+    # quick sanity check (fail fast with a clearer message)
+    sub_dir = os.path.join(data_dir, f"s{args.subject}")
+    if not os.path.isdir(sub_dir):
+        raise FileNotFoundError(
+            f"在 data_dir 下找不到被试目录: {sub_dir}\n"
+            f"当前 data_dir={data_dir}\n"
+            "请确认 BCICIV_2a 目录结构形如: BCICIV_2a/s1, BCICIV_2a/s2, ..."
+        )
+
+    expected_train_mat = os.path.join(sub_dir, f"A0{args.subject}T.mat")
+    expected_test_mat = os.path.join(sub_dir, f"A0{args.subject}E.mat")
+    if (not os.path.exists(expected_train_mat)) or (not os.path.exists(expected_test_mat)):
+        # list a few candidate files to help debugging
+        try:
+            cand = sorted([fn for fn in os.listdir(sub_dir) if fn.startswith(f"A0{args.subject}")])[:50]
+        except Exception:
+            cand = []
+        raise FileNotFoundError(
+            "未找到预期的 .mat 文件（LoadData.load_data_2a 会读取它们）。\n"
+            "期望存在：\n"
+            f"  - {expected_train_mat}\n"
+            f"  - {expected_test_mat}\n"
+            f"当前目录内容（前若干项）: {cand}\n\n"
+            "如果你的数据是 .gdf 版本而不是 .mat 版本，需要改用 Load_BCIC_2a.get_epochs_train/test 的读取方式，"
+            "或者把数据转换为该代码所需的 .mat 格式。"
+        )
 
     # 1) load data (official protocol)
     X_train, y_train, X_test, y_test, _, _ = get_data(
