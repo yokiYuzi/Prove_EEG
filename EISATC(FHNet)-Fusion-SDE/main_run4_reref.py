@@ -17,6 +17,7 @@
 # ============================================================
 
 import os
+import random
 import numpy as np
 import math
 from datetime import timedelta
@@ -39,6 +40,26 @@ from dataLoad.preprocess_reref import get_data  # [MOD] 使用带重参考的预
 from DSTAGNN_my1 import make_model
 
 
+# -----------------------------------------------------------------------------
+# Reproducibility
+# -----------------------------------------------------------------------------
+
+def seed_everything(seed: int = 42) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def seed_worker(worker_id: int) -> None:
+    """DataLoader worker seed."""
+    worker_seed = SEED + worker_id
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
 # ================== [MOD] 重参考（rereference）开关 ==================
 # 说明：x' = x - x_ref（例如以 Cz 为参考），建议在标准化之前做（preprocess_reref 已实现）。
 USE_REREF: bool = True
@@ -53,12 +74,37 @@ USE_FILTERBANK: bool = True         # 3) 是否使用滤波器组分离频带（
 INPUT_SECONDS: float = 4.0           # 4) 输入长度（2.0 或 4.0）
 
 # ================== Lead-Gated Attention（方案1） ==================
-# 目的：在空间注意力 logits 的 softmax 前加入“导联重要性先验 g”，缓解注意力平均化
-USE_LEAD_GATING: bool = True          # 是否启用导联门控（建议保持 True）
-LEAD_GATE_BETA: float = 4.0          # key-bias 强度：score(i->j) += beta * log(g_j)
-LEAD_GATE_GAMMA: float = 0.0         # 可选边门控：score(i->j) += gamma * (g_i * g_j)
-LEAD_GATE_TEMPERATURE: float = 0.5   # g 的 softmax 温度（<1 更尖锐，>1 更平滑）
-LEAD_GATE_HIDDEN: int = 32           # 门控 MLP 隐层宽度
+# 目的：在空间注意力 logits 的 softmax 前加入“导联重要性先验 g”，抑制“注意力平均化”；
+# 同时需要避免 g / 空间注意力过度塌缩（只押单一导联），否则会伤害跨 session 泛化。
+USE_LEAD_GATING: bool = True           # 是否启用导联门控
+
+# (1) 引导强度（建议配合 warmup；不要一上来就很强）
+LEAD_GATE_BETA: float = 1.0           # key-bias 强度：score(i->j) += beta * log(g_j)
+LEAD_GATE_GAMMA: float = 0.0          # 可选边门控：score(i->j) += gamma * (g_i * g_j)
+
+# (2) g 的温度与 log 截断：让引导更“温和”，避免把某些导联直接判死刑
+LEAD_GATE_TEMPERATURE: float = 2.0    # g = softmax(score / tau)，tau>1 更平滑
+LEAD_GATE_G_MIN: float = 5e-3         # 计算 log(g) 时的下限 clamp，避免 log(0)
+LEAD_GATE_HIDDEN: int = 32            # 门控 MLP 隐层宽度
+
+# (3) warmup：前若干 epoch 先学基本表征，再逐步打开引导（避免早期押注捷径）
+LEAD_GATE_WARMUP_EPOCHS: int = 40     # 0~40: beta 从 0 线性升到 LEAD_GATE_BETA
+
+# (4) 熵带宽正则：既防平均（太大），也防塌缩（太小）
+# 解释：entropy 的 exp(H) 可以理解为“有效导联数”。
+USE_LEAD_G_ENTROPY_BAND_REG: bool = True
+LEAD_G_ENTROPY_EFF_MIN: int = 4       # 希望 g 至少参考 ~4 个导联
+LEAD_G_ENTROPY_EFF_MAX: int = 10      # 希望 g 不要扩散到太多导联
+LEAD_G_ENTROPY_LAMBDA: float = 0.02   # 正则系数（建议 0.005~0.05 搜索）
+
+USE_SPATIAL_A_ENTROPY_BAND_REG: bool = True
+SPATIAL_A_ENTROPY_EFF_MIN: int = 4    # 空间注意力每一行至少覆盖 ~4 个 key
+SPATIAL_A_ENTROPY_EFF_MAX: int = 10   # 但不要太接近均匀
+SPATIAL_A_ENTROPY_LAMBDA: float = 0.02
+
+# (5) 训练时的 channel dropout（空间增强）：逼模型学到“多导联冗余稳健表示”
+CHANNEL_DROPOUT_P: float = 0.2        # 每个样本随机丢弃 20% 导联（仅训练）
+CHANNEL_DROPOUT_RESCALE: bool = True  # 是否按 (1-p) 反向缩放以保持期望幅值
 
 # ================== 注意力平均化(Attention Averaging) 监控打印 ==================
 # 说明：
@@ -77,6 +123,10 @@ BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "4"))
 N_EPOCHS = int(os.environ.get("EPOCHS", "200"))
 LR = 1e-3
 VAL_RATIO = 0.1
+
+# Reproducibility
+SEED: int = int(os.environ.get("SEED", "42"))
+
 
 # DSTAGNN 小模型参数
 K_CHEB = 2
@@ -429,38 +479,125 @@ class EEGFeatureExtractor:
 
 # ================== 训练 & 验证 ==================
 def train_one_epoch_eeg(model, loader, optimizer, criterion, device, feat_extractor: EEGFeatureExtractor):
+    """
+    Train for one epoch on Session T.
+
+    Key add-ons for cross-session generalization:
+      1) Channel dropout (space augmentation) on raw EEG
+      2) Entropy band regularization to avoid:
+           - attention too uniform (average)
+           - attention too collapsed (single-lead shortcut)
+    """
     model.train()
     total_loss = 0.0
+    total_reg = 0.0
     total_correct = 0
     total_samples = 0
-    is_distributed = dist.is_initialized()
+
+    is_distributed = dist.is_available() and dist.is_initialized()
+
+    # precompute entropy bounds (natural log)
+    need_reg = bool((USE_LEAD_G_ENTROPY_BAND_REG and USE_LEAD_GATING) or USE_SPATIAL_A_ENTROPY_BAND_REG)
+    H_g_low = math.log(max(2, LEAD_G_ENTROPY_EFF_MIN))
+    H_g_high = math.log(max(2, LEAD_G_ENTROPY_EFF_MAX))
+    H_a_low = math.log(max(2, SPATIAL_A_ENTROPY_EFF_MIN))
+    H_a_high = math.log(max(2, SPATIAL_A_ENTROPY_EFF_MAX))
+
+    # unwrap to access buffers (adj, masks) for spatial-attn reg
+    base_model = model
+    if isinstance(model, (DDP, nn.DataParallel)):
+        base_model = model.module
 
     for inputs, labels in loader:
-        inputs = inputs.to(device)  # (B, C, T)
-        labels = labels.to(device)
+        inputs = inputs.to(device, non_blocking=True)  # (B,C,T)
+        labels = labels.to(device, non_blocking=True)
 
-        x = feat_extractor(inputs)  # (B, C, N_BANDS, T_frames)
+        # --------- (A) Channel dropout on raw EEG (train only) ---------
+        if CHANNEL_DROPOUT_P > 0:
+            B, C, T = inputs.shape
+            keep = (torch.rand((B, C), device=inputs.device) > CHANNEL_DROPOUT_P).float()
+            # avoid pathological all-drop for any sample
+            all_drop = (keep.sum(dim=1) < 1.0)
+            if all_drop.any():
+                keep[all_drop, torch.randint(0, C, (int(all_drop.sum().item()),), device=inputs.device)] = 1.0
+            keep = keep.unsqueeze(-1)  # (B,C,1)
+            inputs = inputs * keep
+            if CHANNEL_DROPOUT_RESCALE and CHANNEL_DROPOUT_P < 1.0:
+                inputs = inputs / (1.0 - CHANNEL_DROPOUT_P)
 
-        optimizer.zero_grad()
-        outputs = model(x)
+        # --------- feature extraction (B,C,T) -> (B,C,N_BANDS,T_frames) ---------
+        x = feat_extractor(inputs)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        # --------- forward (need internal states only when using entropy reg) ---------
+        outputs = model(x, return_internal_states=True) if need_reg else model(x)
         if isinstance(outputs, tuple):
-            outputs = outputs[0]
+            logits, internal_states = outputs
+        else:
+            logits, internal_states = outputs, None
 
-        loss = criterion(outputs, labels)
+        loss_ce = criterion(logits, labels)
+
+        # --------- (B) Entropy band regularization ---------
+        loss_reg = torch.zeros((), device=device)
+
+        if need_reg and internal_states is not None:
+            # (B1) lead-g entropy band (encourage "small subset" rather than one-hot)
+            if USE_LEAD_G_ENTROPY_BAND_REG and USE_LEAD_GATING:
+                # use last block's g
+                g = internal_states[-1].get("lead_gate_g", None)
+                if g is not None:
+                    g = torch.clamp(g, min=1e-12)
+                    g = g / g.sum(dim=-1, keepdim=True)
+                    H = -(g * torch.log(g)).sum(dim=-1)  # (B,)
+                    band = F.relu(torch.tensor(H_g_low, device=device) - H) ** 2 + F.relu(H - torch.tensor(H_g_high, device=device)) ** 2
+                    loss_reg = loss_reg + LEAD_G_ENTROPY_LAMBDA * band.mean()
+
+            # (B2) spatial attention entropy band on the effective logits used by GCN
+            if USE_SPATIAL_A_ENTROPY_BAND_REG:
+                # each block may have multiple heads/orders K
+                for bi, st in enumerate(internal_states):
+                    sat_logits = st.get("sat_scores_for_gcn", None)  # (B,K,N,N) logits
+                    if sat_logits is None:
+                        continue
+                    Bk, K, N, _ = sat_logits.shape
+                    block = base_model.BlockList[bi]
+                    adj = block.adj_pa_static.to(device)
+                    for k in range(K):
+                        mask_k = block.cheb_conv_SAt.mask_per_k[k].to(device)
+                        combined = sat_logits[:, k] + (adj * mask_k).unsqueeze(0)   # (B,N,N)
+                        A = torch.softmax(combined, dim=-1)                         # (B,N,N)
+                        A = torch.clamp(A, min=1e-12)
+                        A = A / A.sum(dim=-1, keepdim=True)
+                        H = -(A * torch.log(A)).sum(dim=-1)                         # (B,N)
+                        band = F.relu(torch.tensor(H_a_low, device=device) - H) ** 2 + F.relu(H - torch.tensor(H_a_high, device=device)) ** 2
+                        loss_reg = loss_reg + SPATIAL_A_ENTROPY_LAMBDA * band.mean()
+
+        loss = loss_ce + loss_reg
         loss.backward()
         optimizer.step()
 
-        total_loss += loss.item() * labels.size(0)
-        preds = torch.argmax(outputs, dim=1)
-        total_correct += (preds == labels).sum().item()
-        total_samples += labels.size(0)
+        with torch.no_grad():
+            preds = torch.argmax(logits, dim=1)
+            correct = (preds == labels).sum().item()
+            bs = labels.size(0)
+            total_correct += correct
+            total_samples += bs
+            total_loss += loss.item() * bs
+            total_reg += loss_reg.item() * bs
 
+    # DDP reduce
     if is_distributed:
-        tensor = torch.tensor([total_loss, total_correct, total_samples], dtype=torch.float64, device=device)
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-        total_loss, total_correct, total_samples = tensor.tolist()
+        loss_tensor = torch.tensor([total_loss, total_reg, total_correct, total_samples], dtype=torch.float32, device=device)
+        dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+        total_loss, total_reg, total_correct, total_samples = loss_tensor.tolist()
 
-    return total_loss / max(1, total_samples), total_correct / max(1, total_samples)
+    avg_loss = total_loss / max(total_samples, 1)
+    avg_reg = total_reg / max(total_samples, 1)
+    avg_acc  = total_correct / max(total_samples, 1)
+
+    return avg_loss, avg_acc, avg_reg
 
 
 def evaluate_eeg(model, loader, criterion, device, feat_extractor: EEGFeatureExtractor):
@@ -494,6 +631,38 @@ def evaluate_eeg(model, loader, criterion, device, feat_extractor: EEGFeatureExt
         "f1_macro": report["macro avg"]["f1-score"],
         "full_report": report,
     }
+
+
+# -----------------------------------------------------------------------------
+# Lead-gate warmup schedule (to avoid early collapse)
+# -----------------------------------------------------------------------------
+def set_lead_gate_schedule(model, epoch: int):
+    """Update lead-gate hyperparameters inside the model blocks."""
+    if not USE_LEAD_GATING:
+        beta = 0.0
+        gamma = 0.0
+        tau = float(LEAD_GATE_TEMPERATURE)
+    else:
+        warm = max(1, int(LEAD_GATE_WARMUP_EPOCHS))
+        factor = min(1.0, float(epoch) / float(warm))
+        beta = float(LEAD_GATE_BETA) * factor
+        gamma = float(LEAD_GATE_GAMMA) * factor
+        tau = float(LEAD_GATE_TEMPERATURE)
+
+    base_model = model
+    if isinstance(model, (DDP, nn.DataParallel)):
+        base_model = model.module
+
+    if hasattr(base_model, "BlockList"):
+        for blk in base_model.BlockList:
+            if hasattr(blk, "lead_gate_beta"):
+                blk.lead_gate_beta = beta
+            if hasattr(blk, "lead_gate_gamma"):
+                blk.lead_gate_gamma = gamma
+            if hasattr(blk, "lead_gate_temperature"):
+                blk.lead_gate_temperature = tau
+
+    return beta, gamma, tau
 
 
 # ================== 主函数（官方协议版） ==================
@@ -721,6 +890,9 @@ def main():
         world_size = 1
         rank = 0
 
+    # ----------------- Seed -----------------
+    seed_everything(SEED)
+
     # ----------------- 打印配置 -----------------
     channels_used = get_channels_used()
     num_channels = len(channels_used)
@@ -732,7 +904,7 @@ def main():
 
     if rank == 0:
         print("=" * 70)
-        print(f"使用设备: {device} | DDP={is_distributed} | world_size={world_size} | rank={rank}")
+        print(f"使用设备: {device} | DDP={is_distributed} | world_size={world_size} | rank={rank} | seed={SEED}")
         print(f"[EXP] {exp_tag}")
         print(f"  - USE_SDE={USE_SDE} (inject_to_gcn={SDE_INJECT_TO_GCN}, alpha={SDE_DYNAMIC_ALPHA})")
         print(f"  - USE_8_LEADS={USE_8_LEADS} | NUM_CHANNELS={num_channels} | channels={channels_used}")
@@ -769,7 +941,7 @@ def main():
         print(f"Subject {subject} | Session T(after): {X_train.shape} | Session E(after): {X_test.shape}")
 
     # ----------------- 3) 从 Session T 划分 train / val -----------------
-    sss = StratifiedShuffleSplit(n_splits=1, test_size=VAL_RATIO, random_state=42)
+    sss = StratifiedShuffleSplit(n_splits=1, test_size=VAL_RATIO, random_state=SEED)
     train_idx, val_idx = next(sss.split(X_train, y_train))
 
     train_dataset = TensorDataset(torch.FloatTensor(X_train[train_idx]), torch.LongTensor(y_train[train_idx]))
@@ -777,22 +949,59 @@ def main():
     test_dataset  = TensorDataset(torch.FloatTensor(X_test),            torch.LongTensor(y_test))
 
     # ----------------- 4) DataLoader -----------------
+    # 为了尽量可复现：
+    # - 非DDP: 使用 generator 固定 shuffle 的随机序列
+    # - DDP: DistributedSampler 使用 seed 并在每个 epoch set_epoch
+    dl_gen = torch.Generator()
+    dl_gen.manual_seed(SEED)
+
     if is_distributed:
-        train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=False)
+        train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=False, seed=SEED)
         train_loader = DataLoader(
-            train_dataset, batch_size=BATCH_SIZE, sampler=train_sampler,
-            num_workers=4, pin_memory=True, persistent_workers=True
+            train_dataset,
+            batch_size=BATCH_SIZE,
+            sampler=train_sampler,
+            num_workers=NUM_WORKERS,
+            pin_memory=True,
+            drop_last=False,
+            persistent_workers=(NUM_WORKERS > 0),
+            worker_init_fn=seed_worker,
         )
     else:
         train_loader = DataLoader(
-            train_dataset, batch_size=BATCH_SIZE, shuffle=True,
-            num_workers=4, pin_memory=True, persistent_workers=True
+            train_dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=True,
+            generator=dl_gen,
+            num_workers=NUM_WORKERS,
+            pin_memory=True,
+            drop_last=False,
+            persistent_workers=(NUM_WORKERS > 0),
+            worker_init_fn=seed_worker,
         )
 
-    val_loader  = DataLoader(val_dataset,  batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+    val_loader  = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+        drop_last=False,
+        persistent_workers=(NUM_WORKERS > 0),
+        worker_init_fn=seed_worker,
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+        drop_last=False,
+        persistent_workers=(NUM_WORKERS > 0),
+        worker_init_fn=seed_worker,
+    )
 
-    # ----------------- 5) 拓扑图 & 模型 -----------------
+# ----------------- 5) 拓扑图 & 模型 -----------------
     adj_mx = build_eeg_2a_adj(channels=channels_used)
 
     model = make_model(
@@ -826,6 +1035,7 @@ def main():
         lead_gate_beta=LEAD_GATE_BETA,
         lead_gate_gamma=LEAD_GATE_GAMMA,
         lead_gate_temperature=LEAD_GATE_TEMPERATURE,
+        lead_gate_g_min=LEAD_GATE_G_MIN,
         lead_gate_hidden=LEAD_GATE_HIDDEN,
     ).to(device)
 
@@ -843,7 +1053,9 @@ def main():
     feat_extractor = EEGFeatureExtractor(fs=FS, bands=BANDS, use_filterbank=USE_FILTERBANK)
 
     # ----------------- 6) 训练 -----------------
-    best_val_f1 = 0.0
+    best_val_f1 = -1.0
+    best_epoch = -1
+    best_val_metrics = None
     best_model_path = os.path.join(save_root, f"sub{subject}", f"best_model_{exp_tag}.pth")
     if rank == 0:
         os.makedirs(os.path.dirname(best_model_path), exist_ok=True)
@@ -852,7 +1064,12 @@ def main():
         if is_distributed:
             train_loader.sampler.set_epoch(epoch)
 
-        train_loss, train_acc = train_one_epoch_eeg(model, train_loader, optimizer, criterion, device, feat_extractor)
+        # warmup the lead-gate strength (avoid early collapse to single lead)
+        beta_cur, gamma_cur, tau_cur = set_lead_gate_schedule(model, epoch)
+        if rank == 0 and (epoch == 1 or epoch % 10 == 0):
+            print(f"[S{subject}][{exp_tag}] [LeadGateSched] epoch={epoch} beta={beta_cur:.4f} gamma={gamma_cur:.4f} tau={tau_cur:.2f} g_min={LEAD_GATE_G_MIN}")
+
+        train_loss, train_acc, train_reg = train_one_epoch_eeg(model, train_loader, optimizer, criterion, device, feat_extractor)
         scheduler.step()
 
         if rank == 0:
@@ -860,7 +1077,7 @@ def main():
             val_metrics = evaluate_eeg(model_eval, val_loader, criterion, device, feat_extractor)
 
             print(f"[S{subject}][{exp_tag}] Epoch {epoch:3d}/{N_EPOCHS} | "
-                  f"Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} | "
+                  f"Train Loss: {train_loss:.4f} (reg {train_reg:.4f}) Acc: {train_acc:.4f} | "
                   f"Val Loss: {val_metrics['loss']:.4f} F1: {val_metrics['f1_macro']:.4f}")
 
             if PRINT_ATTN_AVG_STATS and (epoch == 1 or epoch == N_EPOCHS or (epoch % ATTN_AVG_CHECK_EVERY == 0)):
@@ -873,8 +1090,24 @@ def main():
 
             if val_metrics["f1_macro"] > best_val_f1:
                 best_val_f1 = val_metrics["f1_macro"]
-                torch.save(model_eval.state_dict(), best_model_path)
-                print(f"  → 新最佳模型已保存: {best_model_path} (Val F1 = {best_val_f1:.4f})")
+                best_epoch = epoch
+                best_val_metrics = dict(val_metrics)
+
+                ckpt = {
+                    "epoch": best_epoch,
+                    "val_metrics": best_val_metrics,
+                    "model_state": model_eval.state_dict(),
+                    "exp_tag": exp_tag,
+                    "seed": SEED,
+                    "lead_gate": {
+                        "beta": float(beta_cur),
+                        "gamma": float(gamma_cur),
+                        "tau": float(tau_cur),
+                        "g_min": float(LEAD_GATE_G_MIN),
+                    },
+                }
+                torch.save(ckpt, best_model_path)
+                print(f"  → 新最佳模型已保存: {best_model_path} (BestEpoch={best_epoch} | Val F1 = {best_val_f1:.4f})")
 
     # ----------------- 7) 最终在 Session E 上测试 -----------------
     if rank == 0:
@@ -906,10 +1139,44 @@ def main():
             lead_gate_beta=LEAD_GATE_BETA,
             lead_gate_gamma=LEAD_GATE_GAMMA,
             lead_gate_temperature=LEAD_GATE_TEMPERATURE,
+            lead_gate_g_min=LEAD_GATE_G_MIN,
             lead_gate_hidden=LEAD_GATE_HIDDEN,
         ).to(device)
 
-        final_model.load_state_dict(torch.load(best_model_path, map_location=device))
+        # Load best checkpoint and print the exact best epoch/val metrics
+        ckpt = torch.load(best_model_path, map_location=device)
+        if isinstance(ckpt, dict) and ("model_state" in ckpt):
+            final_model.load_state_dict(ckpt["model_state"])
+            loaded_best_epoch = int(ckpt.get("epoch", -1))
+            loaded_best_val = ckpt.get("val_metrics", {})
+            # restore lead-gate hyperparameters (they are buffers/attrs, not in state_dict)
+            lg = ckpt.get("lead_gate", None)
+            if isinstance(lg, dict):
+                beta0 = float(lg.get("beta", LEAD_GATE_BETA))
+                gamma0 = float(lg.get("gamma", LEAD_GATE_GAMMA))
+                tau0 = float(lg.get("tau", LEAD_GATE_TEMPERATURE))
+                gmin0 = float(lg.get("g_min", LEAD_GATE_G_MIN))
+                for blk in final_model.BlockList:
+                    if hasattr(blk, "lead_gate_beta"):
+                        blk.lead_gate_beta = beta0
+                    if hasattr(blk, "lead_gate_gamma"):
+                        blk.lead_gate_gamma = gamma0
+                    if hasattr(blk, "lead_gate_temperature"):
+                        blk.lead_gate_temperature = tau0
+                    if hasattr(blk, "lead_gate_g_min"):
+                        blk.lead_gate_g_min = gmin0
+        else:
+            # Backward compatibility: old checkpoints may be plain state_dict
+            final_model.load_state_dict(ckpt)
+            loaded_best_epoch = int(best_epoch)
+            loaded_best_val = best_val_metrics if best_val_metrics is not None else {}
+            # approximate lead-gate attrs via the same schedule (for old checkpoints)
+            set_lead_gate_schedule(final_model, loaded_best_epoch)
+
+        if rank == 0:
+            lb_f1 = loaded_best_val.get("f1_macro", None)
+            lb_acc = loaded_best_val.get("acc", None)
+            print(f"[S{subject}][{exp_tag}] Loaded best checkpoint: epoch={loaded_best_epoch} | val_acc={lb_acc} | val_f1={lb_f1}")
         final_model.eval()
 
         if PRINT_ATTN_AVG_STATS:
@@ -922,10 +1189,13 @@ def main():
         test_metrics = evaluate_eeg(final_model, test_loader, criterion, device, feat_extractor)
 
         print("\n" + "=" * 60)
-        print(f"Subject {subject} 最终结果（Session E 测试集，官方协议）")
+        print(f"Subject {subject} 最终结果（跨 session：Session T → Session E）")
         print(f"EXP     : {exp_tag}")
-        print(f"Acc     : {test_metrics['accuracy']:.4f}")
-        print(f"F1(macro): {test_metrics['f1_macro']:.4f}")
+        if (lb_acc is not None) and (lb_f1 is not None):
+            print(f"BestVal : epoch={loaded_best_epoch} | acc={float(lb_acc):.4f} | f1={float(lb_f1):.4f}  (Session T 验证集)")
+        else:
+            print(f"BestVal : epoch={loaded_best_epoch} (Session T 验证集)")
+        print(f"Test    : acc={test_metrics['accuracy']:.4f} | f1={test_metrics['f1_macro']:.4f}  (Session E 测试集)")
         print("=" * 60)
 
     if is_distributed:
