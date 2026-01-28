@@ -535,7 +535,19 @@ def train_one_epoch_eeg(model, loader, optimizer, criterion, device, feat_extrac
         optimizer.zero_grad(set_to_none=True)
 
         # --------- forward (need internal states only when using entropy reg) ---------
-        outputs = model(x, return_internal_states=True) if need_reg else model(x)
+        if need_reg:
+            # IMPORTANT: avoid passing non-tensor kwargs into DataParallel when batch_size < #gpus.
+            # Otherwise scatter_kwargs may create replicas that receive *no* positional inputs.
+            _bm = model.module if isinstance(model, (DDP, nn.DataParallel)) else model
+            _prev_flag = getattr(_bm, "return_internal_states", False)
+            _bm.return_internal_states = True
+            try:
+                outputs = model(x)  # no kwargs => DataParallel scatter is safe
+            finally:
+                _bm.return_internal_states = _prev_flag
+        else:
+            outputs = model(x)
+
         if isinstance(outputs, tuple):
             logits, internal_states = outputs
         else:
