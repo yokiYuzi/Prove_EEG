@@ -555,6 +555,7 @@ class DSTAGNN_block(nn.Module): # DSTAGNN的核心块
                  lead_gate_beta: float = 1.5,
                  lead_gate_gamma: float = 0.0,
                  lead_gate_temperature: float = 1.0,
+                 lead_gate_g_min: float = 5e-3,
                  lead_gate_hidden: int = 32):
         super(DSTAGNN_block, self).__init__()
 
@@ -586,6 +587,9 @@ class DSTAGNN_block(nn.Module): # DSTAGNN的核心块
         self.lead_gate_beta = float(lead_gate_beta)
         self.lead_gate_gamma = float(lead_gate_gamma)
         self.lead_gate_temperature = float(lead_gate_temperature) if lead_gate_temperature is not None else 1.0
+        self.lead_gate_g_min = float(lead_gate_g_min) if lead_gate_g_min is not None else 5e-3
+        if self.lead_gate_g_min < 0.0:
+            self.lead_gate_g_min = 0.0
         self.lead_gate_eps = 1e-8
 
         if self.use_lead_gating:
@@ -674,7 +678,9 @@ class DSTAGNN_block(nn.Module): # DSTAGNN的核心块
             lead_gate_scores = self.lead_gate_mlp(x_TAt_projected).squeeze(-1)
             temp = self.lead_gate_temperature if self.lead_gate_temperature > 0 else 1.0
             lead_gate_g = F.softmax(lead_gate_scores / temp, dim=1)            # (B,N), sum=1
-            lead_gate_logg = torch.log(lead_gate_g + self.lead_gate_eps)       # (B,N)
+            # [NEW] clamp g to avoid huge negative log when some leads get near-zero prob
+            g_for_log = torch.clamp(lead_gate_g, min=max(self.lead_gate_g_min, self.lead_gate_eps))
+            lead_gate_logg = torch.log(g_for_log)                         # (B,N)
         else:
             lead_gate_scores = None
             lead_gate_g = None
@@ -738,11 +744,11 @@ class DSTAGNN_block(nn.Module): # DSTAGNN的核心块
         internal_states = {
             "tat_scores": tat_scores.detach(),
             "sat_scores_static": sat_scores_static.detach(),                 # 静态 logits
-            "sat_scores_for_gcn": sat_scores_for_gcn.detach(),               # 实际用于GCN的 logits（静态或静态+动态混合）
+            "sat_scores_for_gcn": sat_scores_for_gcn,                       # 实际用于GCN的 logits（静态或静态+动态混合）
             "sat_scores_dyn_avg": (sat_dyn_avg.detach() if sat_dyn_avg is not None else torch.zeros_like(sat_scores_static.detach())),
             "sat_scores_seq": sat_scores_seq,                                # 动态序列 logits（保留梯度，供 SDEHead 使用）
-            "lead_gate_scores": (lead_gate_scores.detach() if lead_gate_scores is not None else torch.zeros((batch_size, num_of_vertices), device=x.device)),
-            "lead_gate_g": (lead_gate_g.detach() if lead_gate_g is not None else torch.zeros((batch_size, num_of_vertices), device=x.device)),
+            "lead_gate_scores": (lead_gate_scores if lead_gate_scores is not None else torch.zeros((batch_size, num_of_vertices), device=x.device)),
+            "lead_gate_g": (lead_gate_g if lead_gate_g is not None else torch.zeros((batch_size, num_of_vertices), device=x.device)),
             "gate_weights_gtu3": gate3_weights.detach(),
             "gate_weights_gtu5": gate5_weights.detach(),
             "gate_weights_gtu7": gate7_weights.detach()
@@ -766,6 +772,7 @@ class DSTAGNN_submodule(nn.Module):
                  lead_gate_beta: float = 1.5,
                  lead_gate_gamma: float = 0.0,
                  lead_gate_temperature: float = 1.0,
+                 lead_gate_g_min: float = 5e-3,
                  lead_gate_hidden: int = 32):
         super(DSTAGNN_submodule, self).__init__()
 
@@ -791,6 +798,9 @@ class DSTAGNN_submodule(nn.Module):
         self.lead_gate_beta = float(lead_gate_beta)
         self.lead_gate_gamma = float(lead_gate_gamma)
         self.lead_gate_temperature = float(lead_gate_temperature) if lead_gate_temperature is not None else 1.0
+        self.lead_gate_g_min = float(lead_gate_g_min) if lead_gate_g_min is not None else 5e-3
+        if self.lead_gate_g_min < 0.0:
+            self.lead_gate_g_min = 0.0
         self.lead_gate_hidden = int(lead_gate_hidden)
 
 
@@ -813,6 +823,7 @@ class DSTAGNN_submodule(nn.Module):
                                                lead_gate_beta=self.lead_gate_beta,
                                                lead_gate_gamma=self.lead_gate_gamma,
                                                lead_gate_temperature=self.lead_gate_temperature,
+                                               lead_gate_g_min=self.lead_gate_g_min,
                                                lead_gate_hidden=self.lead_gate_hidden))
             current_num_of_d_for_embedT = nb_chev_filter
             current_in_channels_for_cheb = nb_chev_filter
@@ -1059,7 +1070,8 @@ def make_model(DEVICE, num_of_d_initial_feat, nb_block, initial_in_channels_cheb
                lead_gate_beta: float = 1.5,
                lead_gate_gamma: float = 0.0,
                lead_gate_temperature: float = 1.0,
-               lead_gate_hidden: int = 32
+               lead_gate_g_min: float = 5e-3,
+                 lead_gate_hidden: int = 32
                ):
     if isinstance(adj_mx, np.ndarray):
         adj_mx_tensor = torch.from_numpy(adj_mx).float().to(DEVICE)
@@ -1096,6 +1108,7 @@ def make_model(DEVICE, num_of_d_initial_feat, nb_block, initial_in_channels_cheb
                              lead_gate_beta=lead_gate_beta,
                              lead_gate_gamma=lead_gate_gamma,
                              lead_gate_temperature=lead_gate_temperature,
+                             lead_gate_g_min=lead_gate_g_min,
                              lead_gate_hidden=lead_gate_hidden)
 
     for p in model.parameters():
