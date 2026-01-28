@@ -68,7 +68,7 @@ DROP_REF_CHANNEL: bool = False  # True 会让通道数减少（如 22->21），�
 
 
 # ================== 实验开关（你只需要改这里 4 个） ==================
-USE_SDE: bool = True                 # 1) 是否使用 SDE（动态空间注意力）
+USE_SDE: bool = False                 # 1) 是否使用 SDE（动态空间注意力）
 USE_8_LEADS: bool = False            # 2) 是否使用 8 导联（缩减版）
 USE_FILTERBANK: bool = True         # 3) 是否使用滤波器组分离频带（False=STFT频带功率）
 INPUT_SECONDS: float = 4.0           # 4) 输入长度（2.0 或 4.0）
@@ -120,7 +120,7 @@ CROP_MODE: str = "start"             # "start" 或 "center"
 # ================== 基础超参数（训练相关） ==================
 NUM_CLASSES = 4
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "4"))
-N_EPOCHS = int(os.environ.get("EPOCHS", "200"))
+N_EPOCHS = int(os.environ.get("EPOCHS", "110"))
 LR = 1e-3
 VAL_RATIO = 0.1
 
