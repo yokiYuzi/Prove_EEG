@@ -128,6 +128,10 @@ VAL_RATIO = 0.1
 SEED: int = int(os.environ.get("SEED", "42"))
 
 
+
+# DataLoader workers (can be overridden by env NUM_WORKERS)
+NUM_WORKERS: int = int(os.environ.get("NUM_WORKERS", "4"))
+
 # DSTAGNN 小模型参数
 K_CHEB = 2
 NB_BLOCK = 1
