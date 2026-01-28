@@ -55,9 +55,9 @@ INPUT_SECONDS: float = 4.0           # 4) 输入长度（2.0 或 4.0）
 # ================== Lead-Gated Attention（方案1） ==================
 # 目的：在空间注意力 logits 的 softmax 前加入“导联重要性先验 g”，缓解注意力平均化
 USE_LEAD_GATING: bool = True          # 是否启用导联门控（建议保持 True）
-LEAD_GATE_BETA: float = 1.5          # key-bias 强度：score(i->j) += beta * log(g_j)
+LEAD_GATE_BETA: float = 4.0          # key-bias 强度：score(i->j) += beta * log(g_j)
 LEAD_GATE_GAMMA: float = 0.0         # 可选边门控：score(i->j) += gamma * (g_i * g_j)
-LEAD_GATE_TEMPERATURE: float = 1.0   # g 的 softmax 温度（<1 更尖锐，>1 更平滑）
+LEAD_GATE_TEMPERATURE: float = 0.5   # g 的 softmax 温度（<1 更尖锐，>1 更平滑）
 LEAD_GATE_HIDDEN: int = 32           # 门控 MLP 隐层宽度
 
 # ================== 注意力平均化(Attention Averaging) 监控打印 ==================
