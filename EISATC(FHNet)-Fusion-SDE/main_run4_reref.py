@@ -120,7 +120,7 @@ CROP_MODE: str = "start"             # "start" 或 "center"
 # ================== 基础超参数（训练相关） ==================
 NUM_CLASSES = 4
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "4"))
-N_EPOCHS = int(os.environ.get("EPOCHS", "110"))
+N_EPOCHS = int(os.environ.get("EPOCHS", "300"))
 LR = 1e-3
 VAL_RATIO = 0.1
 
