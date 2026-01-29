@@ -16,7 +16,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import math
 # 假设 utils.py 与 DSTAGNN_my.py 在同一目录或Python路径可找到
 from utils import scaled_Laplacian, cheb_polynomial
 
@@ -550,7 +549,14 @@ class DSTAGNN_block(nn.Module): # DSTAGNN的核心块
                  num_of_vertices, num_of_timesteps_input,
                  d_model_for_spatial_attn, d_k_for_attn, d_v_for_attn, n_heads_for_attn,
                  use_sde: bool = True,
-                 use_dynamic_spatial_for_gcn: bool = True, dynamic_spatial_alpha: float = 0.5):
+                 use_dynamic_spatial_for_gcn: bool = True, dynamic_spatial_alpha: float = 0.5,
+                 # ===== [NEW] Lead-Gated Attention (方案1) =====
+                 use_lead_gating: bool = True,
+                 lead_gate_beta: float = 1.5,
+                 lead_gate_gamma: float = 0.0,
+                 lead_gate_temperature: float = 1.0,
+                 lead_gate_g_min: float = 5e-3,
+                 lead_gate_hidden: int = 32):
         super(DSTAGNN_block, self).__init__()
 
         self.DEVICE = DEVICE
@@ -569,6 +575,35 @@ class DSTAGNN_block(nn.Module): # DSTAGNN的核心块
             self.dynamic_spatial_alpha = 0.0
         elif self.dynamic_spatial_alpha > 1.0:
             self.dynamic_spatial_alpha = 1.0
+
+        # === [新增] Lead-Gated Attention（方案1）
+        # 目标：在空间注意力 logits 的 softmax 之前，引入每个导联的重要性先验 g，
+        #      从而缓解“导联过多且相似 -> 注意力平均化”的问题。
+        #
+        # g 的计算：g = softmax(MLP(x_TAt_projected))，其中 x_TAt_projected 是每个导联的摘要表示 (B,N,D)。
+        # logits 偏置：score(i→j) += beta * log(g_j)
+        # 可选边权门控：score(i→j) += gamma * (g_i * g_j)
+        self.use_lead_gating = bool(use_lead_gating)
+        self.lead_gate_beta = float(lead_gate_beta)
+        self.lead_gate_gamma = float(lead_gate_gamma)
+        self.lead_gate_temperature = float(lead_gate_temperature) if lead_gate_temperature is not None else 1.0
+        self.lead_gate_g_min = float(lead_gate_g_min) if lead_gate_g_min is not None else 5e-3
+        if self.lead_gate_g_min < 0.0:
+            self.lead_gate_g_min = 0.0
+        self.lead_gate_eps = 1e-8
+
+        if self.use_lead_gating:
+            hidden = int(lead_gate_hidden)
+            if hidden < 4:
+                hidden = 4
+            self.lead_gate_mlp = nn.Sequential(
+                nn.LayerNorm(d_model_for_spatial_attn),
+                nn.Linear(d_model_for_spatial_attn, hidden),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden, 1)
+            )
+        else:
+            self.lead_gate_mlp = None
 
         self.EmbedT = Embedding(num_of_timesteps_input, num_of_vertices, num_of_d_features_for_embedT, 'T')
         self.TAt = MultiHeadAttention(DEVICE, num_of_vertices, d_k_for_attn, d_v_for_attn, n_heads_for_attn, num_of_d_features_for_embedT)
@@ -633,13 +668,48 @@ class DSTAGNN_block(nn.Module): # DSTAGNN的核心块
         # === 原有静态 SAt ===
         tat_permuted = TATout.permute(0,3,1,2) # (B,N,F,T)
         x_TAt_projected = self.tat_output_proj(tat_permuted.reshape(batch_size, num_of_vertices, -1))
-        
+
+        # === [新增] Lead-Gated Attention：从每个 trial 的导联摘要表示中估计导联重要性 g ===
+        lead_gate_scores = None
+        lead_gate_g = None
+        lead_gate_logg = None
+        if self.use_lead_gating and (self.lead_gate_mlp is not None):
+            # (B,N,D) -> (B,N)
+            lead_gate_scores = self.lead_gate_mlp(x_TAt_projected).squeeze(-1)
+            temp = self.lead_gate_temperature if self.lead_gate_temperature > 0 else 1.0
+            lead_gate_g = F.softmax(lead_gate_scores / temp, dim=1)            # (B,N), sum=1
+            # [NEW] clamp g to avoid huge negative log when some leads get near-zero prob
+            g_for_log = torch.clamp(lead_gate_g, min=max(self.lead_gate_g_min, self.lead_gate_eps))
+            lead_gate_logg = torch.log(g_for_log)                         # (B,N)
+        else:
+            lead_gate_scores = None
+            lead_gate_g = None
+            lead_gate_logg = None
+
         SEmx_TAt = self.EmbedS(x_TAt_projected, batch_size)
         SEmx_TAt_dropped = self.dropout(SEmx_TAt)
         sat_scores_static = self.SAt(SEmx_TAt_dropped, SEmx_TAt_dropped, attn_mask=None) # (B,K,N,N) [静态 logits]
 
+        # === [新增] 在 softmax 前，用 g 对空间注意力 logits 加偏置（static + dynamic） ===
+        if lead_gate_logg is not None:
+            # key-bias: score(i->j) += beta * log(g_j)
+            key_bias_static = self.lead_gate_beta * lead_gate_logg[:, None, None, :]    # (B,1,1,N) -> broadcast to (B,K,N,N)
+            sat_scores_static = sat_scores_static + key_bias_static
+
+            if sat_scores_seq is not None:
+                key_bias_seq = self.lead_gate_beta * lead_gate_logg[:, None, None, None, :]  # (B,1,1,1,N) -> (B,T,K,N,N)
+                sat_scores_seq = sat_scores_seq + key_bias_seq
+
+            # optional edge gating: score(i->j) += gamma * (g_i * g_j)
+            if self.lead_gate_gamma != 0.0 and (lead_gate_g is not None):
+                edge_gate = (lead_gate_g[:, :, None] * lead_gate_g[:, None, :])  # (B,N,N)
+                sat_scores_static = sat_scores_static + self.lead_gate_gamma * edge_gate[:, None, :, :]
+                if sat_scores_seq is not None:
+                    sat_scores_seq = sat_scores_seq + self.lead_gate_gamma * edge_gate[:, None, None, :, :]
+
         # === [增强] 将动态 sat_scores_seq 注入 GCN 的邻接权重（可选） ===
         if self.use_dynamic_spatial_for_gcn:
+            # 注意：这里用的是“已经做过 lead-gate 偏置”的 sat_scores_seq
             sat_dyn_avg = sat_scores_seq.mean(dim=1)  # (B,K,N,N) —— 动态 logits 的时间平均
             alpha = self.dynamic_spatial_alpha
             sat_scores_for_gcn = (1.0 - alpha) * sat_scores_static + alpha * sat_dyn_avg
@@ -674,9 +744,11 @@ class DSTAGNN_block(nn.Module): # DSTAGNN的核心块
         internal_states = {
             "tat_scores": tat_scores.detach(),
             "sat_scores_static": sat_scores_static.detach(),                 # 静态 logits
-            "sat_scores_for_gcn": sat_scores_for_gcn.detach(),               # 实际用于GCN的 logits（静态或静态+动态混合）
+            "sat_scores_for_gcn": sat_scores_for_gcn,                       # 实际用于GCN的 logits（静态或静态+动态混合）
             "sat_scores_dyn_avg": (sat_dyn_avg.detach() if sat_dyn_avg is not None else torch.zeros_like(sat_scores_static.detach())),
             "sat_scores_seq": sat_scores_seq,                                # 动态序列 logits（保留梯度，供 SDEHead 使用）
+            "lead_gate_scores": (lead_gate_scores if lead_gate_scores is not None else torch.zeros((batch_size, num_of_vertices), device=x.device)),
+            "lead_gate_g": (lead_gate_g if lead_gate_g is not None else torch.zeros((batch_size, num_of_vertices), device=x.device)),
             "gate_weights_gtu3": gate3_weights.detach(),
             "gate_weights_gtu5": gate5_weights.detach(),
             "gate_weights_gtu7": gate7_weights.detach()
@@ -694,7 +766,14 @@ class DSTAGNN_submodule(nn.Module):
                  output_memory=False, return_internal_states=False,
                  use_sde: bool = True,
                  use_dynamic_spatial_for_gcn: bool = True,
-                 dynamic_spatial_alpha: float = 0.5):
+                 dynamic_spatial_alpha: float = 0.5,
+                 # ===== [NEW] Lead-Gated Attention (方案1) =====
+                 use_lead_gating: bool = True,
+                 lead_gate_beta: float = 1.5,
+                 lead_gate_gamma: float = 0.0,
+                 lead_gate_temperature: float = 1.0,
+                 lead_gate_g_min: float = 5e-3,
+                 lead_gate_hidden: int = 32):
         super(DSTAGNN_submodule, self).__init__()
 
         if output_memory:
@@ -714,6 +793,16 @@ class DSTAGNN_submodule(nn.Module):
         self.use_dynamic_spatial_for_gcn = bool(use_dynamic_spatial_for_gcn)
         self.dynamic_spatial_alpha = float(dynamic_spatial_alpha)
 
+        # ===== [NEW] Lead-Gated Attention (方案1) =====
+        self.use_lead_gating = bool(use_lead_gating)
+        self.lead_gate_beta = float(lead_gate_beta)
+        self.lead_gate_gamma = float(lead_gate_gamma)
+        self.lead_gate_temperature = float(lead_gate_temperature) if lead_gate_temperature is not None else 1.0
+        self.lead_gate_g_min = float(lead_gate_g_min) if lead_gate_g_min is not None else 5e-3
+        if self.lead_gate_g_min < 0.0:
+            self.lead_gate_g_min = 0.0
+        self.lead_gate_hidden = int(lead_gate_hidden)
+
 
         self.BlockList = nn.ModuleList()
         current_num_of_d_for_embedT = num_of_d_initial_feat
@@ -729,7 +818,13 @@ class DSTAGNN_submodule(nn.Module):
                                                d_model_for_spatial_attn, d_k_for_attn, d_v_for_attn, n_heads_for_attn,
                                                use_sde=self.use_sde,
                                                use_dynamic_spatial_for_gcn=self.use_dynamic_spatial_for_gcn,
-                                               dynamic_spatial_alpha=self.dynamic_spatial_alpha))
+                                               dynamic_spatial_alpha=self.dynamic_spatial_alpha,
+                                               use_lead_gating=self.use_lead_gating,
+                                               lead_gate_beta=self.lead_gate_beta,
+                                               lead_gate_gamma=self.lead_gate_gamma,
+                                               lead_gate_temperature=self.lead_gate_temperature,
+                                               lead_gate_g_min=self.lead_gate_g_min,
+                                               lead_gate_hidden=self.lead_gate_hidden))
             current_num_of_d_for_embedT = nb_chev_filter
             current_in_channels_for_cheb = nb_chev_filter
             if current_time_strides_for_gtu > 0:
@@ -869,7 +964,114 @@ class DSTAGNN_submodule(nn.Module):
                 "meta": {"T": T, "N": N}
             }
 
-    def forward(self, x):
+    # =====================================================================
+    #  [新增] 导出 SDE（Lead-Gated 后的动态空间注意力）
+    # =====================================================================
+    @torch.no_grad()
+    def export_sde_attention_sequences(
+        self,
+        x: torch.Tensor,
+        return_prob: bool = False,
+        return_node_stats: bool = True,
+        include_static_and_gcn: bool = True,
+        detach_to_cpu: bool = True,
+    ):
+        """
+        目的：
+          - 导出 **New 算法里经 Lead-Gating 引导后的 SDE 动态空间注意力**，用于你后续做
+            “跨导联注意力转移现象”的数学建模/画图/ML 特征工程。
+
+        输入：
+          x: 标准模型输入 (B, N, F, T)
+            - 对于你当前 BCIC/EEG 脚本：x = bandpower 特征 (B, C, N_BANDS, T_frames)
+            - 对于 ECG/其它：同样遵循 (B, N, F, T)
+
+        输出：dict（默认全部为 torch.Tensor；detach_to_cpu=True 时会搬到 CPU）：
+          - sat_scores_seq: (B, T, K, N, N)  动态空间注意力 logits（Lead-Gated 后）
+          - sat_prob_seq   : (B, T, K, N, N)  动态注意力概率（可选）
+          - node_entropy_seq: (B, T, N)       节点级“行分布熵”（对 head 平均）
+          - node_inflow_seq : (B, T, N)       节点级“入流中心度” Σ_src P(src->node)（对 head 平均）
+          - lead_gate_g     : (B, N)          Lead gate 概率分布 g（若未启用则为 0）
+          - lead_gate_scores: (B, N)          Lead gate 打分（未 softmax，若未启用则为 0）
+          - sat_scores_static: (B, K, N, N)   静态空间注意力 logits（Lead-Gated 后）[可选]
+          - sat_scores_dyn_avg: (B, K, N, N)  动态注意力时间平均 logits（Lead-Gated 后）[可选]
+          - sat_scores_for_gcn: (B, K, N, N)  实际用于 GCN 的空间 logits（可能是静态+动态融合）[可选]
+          - meta: {B,T,N,K,use_sde,use_lead_gating}
+        """
+
+        self.eval()
+
+        # ---- 跑一遍 block，抓最后一层内部状态 ----
+        res_att_prev = 0
+        cur = x
+        last_states = None
+        for blk in self.BlockList:
+            cur, res_att_prev, last_states = blk(cur, res_att_prev)
+
+        # ---- 基本维度 ----
+        # 注意：如果模型有多层 block 且存在 stride，下游 block 的时间长度可能会变短。
+        # 因此这里以 sat_scores_seq 的真实 T 为准（若不存在才退回到输入 x 的 T）。
+        B = int(x.size(0))
+        N = int(x.size(1))
+        K = int(self.K_cheb)
+
+        # ---- 取 SDE 动态空间注意力（Lead-Gated 后）----
+        sat_scores_seq = None
+        if (last_states is not None) and ("sat_scores_seq" in last_states):
+            sat_scores_seq = last_states.get("sat_scores_seq", None)
+
+        # 兼容：未启用 SDE 或 sat_scores_seq 不存在
+        if sat_scores_seq is None:
+            T_dyn = int(x.size(-1))
+            sat_scores_seq = torch.zeros(B, T_dyn, K, N, N, device=x.device, dtype=x.dtype)
+        else:
+            T_dyn = int(sat_scores_seq.size(1))
+
+        out = {
+            "sat_scores_seq": sat_scores_seq,
+            "lead_gate_scores": (last_states.get("lead_gate_scores") if last_states is not None else None),
+            "lead_gate_g": (last_states.get("lead_gate_g") if last_states is not None else None),
+        }
+
+        # ---- 可选：静态 / 动态平均 / GCN 实际用的 logits ----
+        if include_static_and_gcn and (last_states is not None):
+            for k in ["sat_scores_static", "sat_scores_dyn_avg", "sat_scores_for_gcn"]:
+                if k in last_states:
+                    out[k] = last_states[k]
+
+        # ---- 可选：概率化 ----
+        if return_prob:
+            out["sat_prob_seq"] = torch.softmax(sat_scores_seq, dim=-1)
+
+        # ---- 可选：节点级统计序列（与 Old 的 node_entropy_seq/node_inflow_seq 对齐） ----
+        if return_node_stats:
+            P = torch.softmax(sat_scores_seq, dim=-1)  # (B,T,K,N,N)
+            eps = 1e-8
+            p_clamp = P.clamp_min(eps)
+            ent = -(p_clamp * p_clamp.log()).sum(dim=-1)      # (B,T,K,N)
+            node_entropy_seq = ent.mean(dim=2)                # (B,T,N)
+            node_inflow_seq = P.sum(dim=3).mean(dim=2)        # (B,T,N)
+            out["node_entropy_seq"] = node_entropy_seq
+            out["node_inflow_seq"] = node_inflow_seq
+
+        out["meta"] = {
+            "B": B,
+            "T": T_dyn,
+            "N": N,
+            "K": K,
+            "use_sde": bool(getattr(self, "use_sde", False)),
+            "use_lead_gating": bool(getattr(self, "use_lead_gating", False)),
+        }
+
+        # ---- 输出搬到 CPU（便于 np.savez / 画图） ----
+        if detach_to_cpu:
+            for k, v in list(out.items()):
+                if torch.is_tensor(v):
+                    out[k] = v.detach().cpu()
+        return out
+
+    def forward(self, x, return_internal_states: bool = None):
+        do_return_internal_states = self.return_internal_states if return_internal_states is None else bool(return_internal_states)
         block_outputs_concat_time = []
         res_att_prev = 0
         all_blocks_internal_states = []
@@ -879,7 +1081,7 @@ class DSTAGNN_submodule(nn.Module):
         for i, block in enumerate(self.BlockList):
             block_output, res_att_current, current_block_internal_states = block(current_x_for_block, res_att_prev)
             block_outputs_concat_time.append(block_output)
-            if self.return_internal_states:
+            if do_return_internal_states:
                 all_blocks_internal_states.append(current_block_internal_states)
             res_att_prev = res_att_current
             current_x_for_block = block_output
@@ -955,414 +1157,28 @@ class DSTAGNN_submodule(nn.Module):
             output1_permuted = output1.permute(0,2,1)
             output = self.final_prediction_fc(output1_permuted)
 
-        if self.return_internal_states:
+        if do_return_internal_states:
             return output, all_blocks_internal_states
         else:
             return output
 
 
-# ======================================================================
-# Axial Longformer-style Sparse Temporal Attention for EEG Classification
-#   - 时间轴：局部窗口稀疏注意力 + 少量全局token（Longformer风格）
-#   - 空间轴（电极）：全连接注意力（稠密）
-#   - 轴向建模：Temporal(稀疏) -> FFN -> Spatial(稠密) -> FFN，堆叠 nb_block 次
-#
-# 说明：
-#   1) 输入仍保持 (B, N_electrodes, F_features, T_frames) 与你的现有特征提取一致
-#   2) Temporal 全局 token 是“每个电极一组”的 learnable token（数量 G 很小，默认 1）
-#   3) 最终分类：取每个电极的 time-global token（index=0）作为电极摘要，再加一个 Spatial-CLS 进行汇聚
-#   4) 该方案更偏“泛化优先”的结构约束：时间只允许局部交互 + 少量全局汇聚
-# ======================================================================
-
-class MultiHeadSelfAttention(nn.Module):
-    """标准多头自注意力（支持 bool mask）。输入: (B, L, D) -> 输出: (B, L, D)"""
-    def __init__(self, d_model: int, n_heads: int, attn_dropout: float = 0.0, proj_dropout: float = 0.0):
-        super().__init__()
-        if d_model % n_heads != 0:
-            raise ValueError(f"d_model={d_model} 必须能被 n_heads={n_heads} 整除。")
-        self.d_model = int(d_model)
-        self.n_heads = int(n_heads)
-        self.d_head = self.d_model // self.n_heads
-        self.scale = 1.0 / math.sqrt(self.d_head)
-
-        self.qkv = nn.Linear(self.d_model, 3 * self.d_model, bias=True)
-        self.attn_drop = nn.Dropout(attn_dropout)
-        self.proj = nn.Linear(self.d_model, self.d_model, bias=True)
-        self.proj_drop = nn.Dropout(proj_dropout)
-
-    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
-        # x: (B, L, D)
-        B, L, D = x.shape
-        qkv = self.qkv(x)  # (B, L, 3D)
-        qkv = qkv.reshape(B, L, 3, self.n_heads, self.d_head).permute(2, 0, 3, 1, 4)  # (3, B, H, L, Dh)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # (B, H, L, Dh)
-
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (B, H, L, L)
-
-        if attn_mask is not None:
-            # attn_mask: bool, True 表示要mask掉
-            if attn_mask.dtype != torch.bool:
-                raise TypeError(f"attn_mask 需要是 bool 类型，但收到 {attn_mask.dtype}")
-            scores = scores.masked_fill(attn_mask, -1e9)
-
-        attn = F.softmax(scores, dim=-1)
-        attn = self.attn_drop(attn)
-
-        out = torch.matmul(attn, v)  # (B, H, L, Dh)
-        out = out.transpose(1, 2).reshape(B, L, D)  # (B, L, D)
-        out = self.proj(out)
-        out = self.proj_drop(out)
-        return out
-
-
-class FeedForward(nn.Module):
-    """标准 Transformer FFN：Linear -> GELU -> Drop -> Linear -> Drop"""
-    def __init__(self, d_model: int, hidden_mult: int = 4, dropout: float = 0.1):
-        super().__init__()
-        hidden_dim = int(d_model) * int(hidden_mult)
-        self.net = nn.Sequential(
-            nn.Linear(d_model, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, d_model),
-            nn.Dropout(dropout),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
-def _build_longformer_local_global_mask(L: int, num_global: int, window_size: int, device: torch.device) -> torch.Tensor:
-    """
-    Longformer风格 mask（非因果、双向）：
-      - 全局token(0..G-1) 作为 query：可看所有 key
-      - 普通token(G..L-1) 作为 query：可看
-          (a) 所有 global key
-          (b) 自己附近 window_size 范围内的普通 key
-    返回: bool mask，True 表示该位置被屏蔽（不可见）
-    """
-    G = int(num_global)
-    w = int(window_size)
-    if G < 0:
-        raise ValueError("num_global_tokens 不能为负。")
-    if w < 0:
-        raise ValueError("window_size 不能为负。")
-    if L <= 0:
-        raise ValueError("L 必须 > 0")
-
-    mask = torch.ones((L, L), dtype=torch.bool, device=device)  # True=mask
-
-    # 1) global queries: unmask all keys
-    if G > 0:
-        mask[:G, :] = False
-
-    # 2) all queries can see global keys
-    if G > 0:
-        mask[:, :G] = False
-
-    # 3) local-local window
-    T = L - G
-    if T > 0:
-        idx = torch.arange(T, device=device)
-        dist = (idx[:, None] - idx[None, :]).abs()
-        band_mask = dist > w  # True=mask outside window
-        mask[G:, G:] = band_mask
-
-    return mask
-
-
-class AxialLongformerBlock(nn.Module):
-    """
-    输入/输出: (B, N, L, D)
-      - Temporal: 对每个电极独立做 (B*N, L, D) 的 Longformer-style local+global attention
-      - Spatial : 对每个 time index 独立做 (B*L, N, D) 的全连接注意力
-    """
-    def __init__(
-        self,
-        d_model: int,
-        n_heads: int,
-        num_global_tokens: int,
-        window_size: int,
-        attn_dropout: float = 0.1,
-        proj_dropout: float = 0.1,
-        ffn_mult: int = 4,
-        ffn_dropout: float = 0.1,
-        max_seq_len_local: int | None = None,  # 仅用于提前构建mask（可选）
-    ):
-        super().__init__()
-        self.d_model = int(d_model)
-        self.n_heads = int(n_heads)
-        self.num_global_tokens = int(num_global_tokens)
-        self.window_size = int(window_size)
-
-        # --- Temporal (稀疏) ---
-        self.temporal_norm1 = nn.LayerNorm(d_model)
-        self.temporal_attn = MultiHeadSelfAttention(d_model, n_heads, attn_dropout=attn_dropout, proj_dropout=proj_dropout)
-        self.temporal_norm2 = nn.LayerNorm(d_model)
-        self.temporal_ffn = FeedForward(d_model, hidden_mult=ffn_mult, dropout=ffn_dropout)
-
-        # --- Spatial (稠密) ---
-        self.spatial_norm1 = nn.LayerNorm(d_model)
-        self.spatial_attn = MultiHeadSelfAttention(d_model, n_heads, attn_dropout=attn_dropout, proj_dropout=proj_dropout)
-        self.spatial_norm2 = nn.LayerNorm(d_model)
-        self.spatial_ffn = FeedForward(d_model, hidden_mult=ffn_mult, dropout=ffn_dropout)
-
-        # 预构建 temporal mask（如果给了 max_seq_len_local）
-        self.register_buffer("temporal_attn_mask", None, persistent=False)
-        if max_seq_len_local is not None:
-            L = int(max_seq_len_local) + self.num_global_tokens
-            # 这里 device 用 cpu；后续 model.to(device) 会把 buffer 一起搬过去
-            self.temporal_attn_mask = _build_longformer_local_global_mask(
-                L=L, num_global=self.num_global_tokens, window_size=self.window_size, device=torch.device("cpu")
-            )
-
-    def _get_temporal_mask(self, L: int, device: torch.device) -> torch.Tensor:
-        # 若预构建mask存在且长度匹配，则直接用；否则动态构建
-        if (self.temporal_attn_mask is not None) and (self.temporal_attn_mask.size(0) == L):
-            return self.temporal_attn_mask.to(device)
-        return _build_longformer_local_global_mask(L=L, num_global=self.num_global_tokens, window_size=self.window_size, device=device)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, N, L, D)
-        B, N, L, D = x.shape
-        device = x.device
-
-        # ---- Temporal sparse attention (per-electrode) ----
-        x_norm = self.temporal_norm1(x)
-        x_t = x_norm.reshape(B * N, L, D)
-        mask = self._get_temporal_mask(L=L, device=device)  # (L,L) bool
-        x_t = self.temporal_attn(x_t, attn_mask=mask)
-        x_t = x_t.reshape(B, N, L, D)
-        x = x + x_t
-
-        x_ffn = self.temporal_ffn(self.temporal_norm2(x))
-        x = x + x_ffn
-
-        # ---- Spatial dense attention (per-time-index) ----
-        x_norm = self.spatial_norm1(x)
-        x_s = x_norm.permute(0, 2, 1, 3).reshape(B * L, N, D)  # (B*L, N, D)
-        x_s = self.spatial_attn(x_s, attn_mask=None)
-        x_s = x_s.reshape(B, L, N, D).permute(0, 2, 1, 3)       # (B, N, L, D)
-        x = x + x_s
-
-        x_ffn = self.spatial_ffn(self.spatial_norm2(x))
-        x = x + x_ffn
-
-        return x
-
-
-class AxialLongformerEEGClassifier(nn.Module):
-    """
-    输入:  x (B, N_electrodes, F_features, T_frames)
-    输出: logits (B, num_classes)
-    """
-    def __init__(
-        self,
-        num_vertices: int,
-        in_features: int,
-        seq_len: int,
-        num_classes: int,
-        d_model: int = 64,
-        n_heads: int = 4,
-        n_layers: int = 2,
-        window_size: int = 4,
-        num_global_tokens: int = 1,
-        dropout: float = 0.1,
-        ffn_mult: int = 4,
-    ):
-        super().__init__()
-        self.num_vertices = int(num_vertices)
-        self.in_features = int(in_features)
-        self.seq_len = int(seq_len)
-        self.num_classes = int(num_classes)
-        self.d_model = int(d_model)
-        self.n_heads = int(n_heads)
-        self.n_layers = int(n_layers)
-        self.window_size = int(window_size)
-        self.num_global_tokens = int(num_global_tokens)
-
-        if self.num_global_tokens < 1:
-            raise ValueError("num_global_tokens 建议 >= 1（否则就退化为纯局部窗口注意力）。")
-
-        # 输入投影：频带特征 F -> d_model
-        self.in_proj = nn.Linear(self.in_features, self.d_model)
-
-        # 轴向位置编码：time + electrode
-        # time embedding length = (G + max_T)
-        self.time_embed = nn.Embedding(self.num_global_tokens + self.seq_len, self.d_model)
-        self.elec_embed = nn.Embedding(self.num_vertices, self.d_model)
-
-        # temporal global tokens（每个电极一组，shared 参数）
-        self.global_time_tokens = nn.Parameter(torch.randn(self.num_global_tokens, self.d_model) * 0.02)
-
-        # Axial blocks
-        self.blocks = nn.ModuleList([
-            AxialLongformerBlock(
-                d_model=self.d_model,
-                n_heads=self.n_heads,
-                num_global_tokens=self.num_global_tokens,
-                window_size=self.window_size,
-                attn_dropout=dropout,
-                proj_dropout=dropout,
-                ffn_mult=ffn_mult,
-                ffn_dropout=dropout,
-                max_seq_len_local=self.seq_len,
-            )
-            for _ in range(self.n_layers)
-        ])
-
-        # 最终空间汇聚：加一个 Spatial-CLS
-        self.spatial_cls = nn.Parameter(torch.randn(1, 1, self.d_model) * 0.02)
-        self.final_norm = nn.LayerNorm(self.d_model)
-        self.final_spatial_attn = MultiHeadSelfAttention(self.d_model, self.n_heads, attn_dropout=dropout, proj_dropout=dropout)
-        self.final_ffn = FeedForward(self.d_model, hidden_mult=ffn_mult, dropout=dropout)
-
-        self.head = nn.Sequential(
-            nn.LayerNorm(self.d_model),
-            nn.Dropout(dropout),
-            nn.Linear(self.d_model, self.num_classes),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, N, F, T)
-        if x.dim() != 4:
-            raise ValueError(f"期望输入形状 (B,N,F,T)，但收到 {tuple(x.shape)}")
-        B, N, F_in, T = x.shape
-        if N != self.num_vertices:
-            raise ValueError(f"输入电极数 N={N} 与 num_vertices={self.num_vertices} 不一致。")
-        if F_in != self.in_features:
-            raise ValueError(f"输入特征数 F={F_in} 与 in_features={self.in_features} 不一致。")
-        if T > self.seq_len:
-            raise ValueError(
-                f"输入时间帧 T={T} 大于模型初始化的 seq_len={self.seq_len}。"
-                "请在 make_model 里把 len_input_total 设为真实 T_frames，或增大 seq_len。"
-            )
-
-        # (B,N,F,T) -> (B,N,T,F)
-        x = x.permute(0, 1, 3, 2).contiguous()
-        # 投影到 d_model: (B,N,T,D)
-        x = self.in_proj(x)
-
-        # 拼接 temporal global tokens: (B,N,G,D) + (B,N,T,D) -> (B,N,L,D)
-        G = self.num_global_tokens
-        gtok = self.global_time_tokens.view(1, 1, G, self.d_model).expand(B, N, G, self.d_model)
-        x = torch.cat([gtok, x], dim=2)  # L = G + T
-
-        # 加 time embedding（只用前 L 个位置）
-        L = x.size(2)
-        pos_t = torch.arange(L, device=x.device, dtype=torch.long)
-        time_pe = self.time_embed(pos_t).view(1, 1, L, self.d_model)
-        x = x + time_pe
-
-        # 加 electrode embedding
-        pos_n = torch.arange(N, device=x.device, dtype=torch.long)
-        elec_pe = self.elec_embed(pos_n).view(1, N, 1, self.d_model)
-        x = x + elec_pe
-
-        # Axial blocks
-        for blk in self.blocks:
-            x = blk(x)  # (B,N,L,D)
-
-        # 取 time-global token (index=0) 作为每个电极的摘要 (B,N,D)
-        x_elec = x[:, :, 0, :]
-
-        # 加 Spatial-CLS，做一次稠密空间注意力汇聚
-        cls = self.spatial_cls.expand(B, -1, -1)  # (B,1,D)
-        x_sp = torch.cat([cls, x_elec], dim=1)    # (B,N+1,D)
-
-        x_sp_norm = self.final_norm(x_sp)
-        x_sp = x_sp + self.final_spatial_attn(x_sp_norm, attn_mask=None)
-        x_sp = x_sp + self.final_ffn(self.final_norm(x_sp))
-
-        cls_out = x_sp[:, 0, :]  # (B,D)
-        logits = self.head(cls_out)
-        return logits
-
-def make_model(
-    DEVICE,
-    num_of_d_initial_feat,
-    nb_block,
-    initial_in_channels_cheb,
-    K_cheb,
-    nb_chev_filter,
-    nb_time_filter_block_unused,
-    initial_time_strides,
-    adj_mx,
-    adj_pa_static,
-    adj_TMD_static_unused,
-    num_for_predict_per_node,
-    len_input_total,
-    num_of_vertices,
-    d_model_for_spatial_attn,
-    d_k_for_attn,
-    d_v_for_attn,
-    n_heads_for_attn,
-    task_type='regression',
-    num_classes=None,
-    output_memory=False,
-    return_internal_states=False,
-    use_sde: bool = True,
-    use_dynamic_spatial_for_gcn: bool = True,
-    dynamic_spatial_alpha: float = 0.5,
-    # ================== 新增：模型变体与 Longformer 相关参数 ==================
-    model_variant: str = "dstagnn",              # "dstagnn" 或 "axial_longformer"
-    longformer_window_size: int = 4,             # 时间局部窗口半径（左右各 window_size）
-    longformer_num_global_tokens: int = 1,       # 每个电极的时间全局 token 数量（建议 1）
-    longformer_dropout: float = 0.1,
-    longformer_ffn_mult: int = 4,
-):
-    """
-    兼容你现有训练脚本的 make_model 接口，同时新增 model_variant 以便切换：
-      - model_variant="dstagnn"         ：原 DSTAGNN（你当前文件里的实现）
-      - model_variant="axial_longformer": 本次新增的“时间稀疏+空间稠密”的轴向 Longformer 风格模型
-
-    注意：
-      - 当 model_variant="axial_longformer" 时，adj_mx / cheb 等图卷积相关参数不会被使用（保留接口是为了不破坏脚本）。
-      - 该变体目前面向 classification 任务（你当前需求），若用于 regression/memory 可再扩展。
-    """
-    model_variant = (model_variant or "dstagnn").lower().strip()
-
-    # -------------------- 1) Axial Longformer EEG Classifier --------------------
-    if model_variant in ("axial_longformer", "longformer", "axial"):
-        if task_type != "classification":
-            raise ValueError(
-                f"AxialLongformerEEGClassifier 当前仅实现 classification，但收到 task_type={task_type}。"
-            )
-        if num_classes is None:
-            raise ValueError("num_classes must be specified for classification.")
-
-        model = AxialLongformerEEGClassifier(
-            num_vertices=int(num_of_vertices),
-            in_features=int(num_of_d_initial_feat),   # 频带数 N_BANDS
-            seq_len=int(len_input_total),             # T_frames
-            num_classes=int(num_classes),
-            d_model=int(d_model_for_spatial_attn),
-            n_heads=int(n_heads_for_attn),
-            n_layers=int(nb_block),
-            window_size=int(longformer_window_size),
-            num_global_tokens=int(longformer_num_global_tokens),
-            dropout=float(longformer_dropout),
-            ffn_mult=int(longformer_ffn_mult),
-        ).to(DEVICE)
-
-        # 更标准的初始化（比“对所有参数都 uniform”更稳）
-        def _init_longformer(m: nn.Module):
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.Embedding):
-                nn.init.normal_(m.weight, mean=0.0, std=0.02)
-            elif isinstance(m, nn.LayerNorm):
-                if m.weight is not None:
-                    nn.init.ones_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-        model.apply(_init_longformer)
-        return model
-
-    # -------------------- 2) 原 DSTAGNN --------------------
-    # 保持你原先的逻辑不变（避免你已有 baseline 被不必要改变）
+def make_model(DEVICE, num_of_d_initial_feat, nb_block, initial_in_channels_cheb, K_cheb,
+               nb_chev_filter, nb_time_filter_block_unused, initial_time_strides, adj_mx, adj_pa_static,
+               adj_TMD_static_unused, num_for_predict_per_node, len_input_total, num_of_vertices,
+               d_model_for_spatial_attn, d_k_for_attn, d_v_for_attn, n_heads_for_attn,
+               task_type='regression', num_classes=None, output_memory=False, return_internal_states=False,
+               use_sde: bool = True,
+               use_dynamic_spatial_for_gcn: bool = True,
+               dynamic_spatial_alpha: float = 0.5,
+               # ===== [NEW] Lead-Gated Attention (方案1) =====
+               use_lead_gating: bool = True,
+               lead_gate_beta: float = 1.5,
+               lead_gate_gamma: float = 0.0,
+               lead_gate_temperature: float = 1.0,
+               lead_gate_g_min: float = 5e-3,
+                 lead_gate_hidden: int = 32
+               ):
     if isinstance(adj_mx, np.ndarray):
         adj_mx_tensor = torch.from_numpy(adj_mx).float().to(DEVICE)
     elif isinstance(adj_mx, torch.Tensor):
@@ -1372,7 +1188,7 @@ def make_model(
 
     L_tilde = scaled_Laplacian(adj_mx_tensor.cpu().numpy())
     cheb_polynomials = [torch.from_numpy(i).type(torch.FloatTensor).to(DEVICE) for i in cheb_polynomial(L_tilde, K_cheb)]
-
+    
     if isinstance(adj_pa_static, np.ndarray):
         adj_pa_tensor = torch.from_numpy(adj_pa_static).float().to(DEVICE)
     else:
@@ -1383,33 +1199,23 @@ def make_model(
     else:
         adj_TMD_tensor = torch.as_tensor(adj_TMD_static_unused, dtype=torch.float32, device=DEVICE)
 
-    model = DSTAGNN_submodule(
-        DEVICE,
-        num_of_d_initial_feat,
-        nb_block,
-        initial_in_channels_cheb,
-        K_cheb,
-        nb_chev_filter,
-        nb_time_filter_block_unused,
-        initial_time_strides,
-        cheb_polynomials,
-        adj_pa_tensor,
-        adj_TMD_tensor,
-        num_for_predict_per_node,
-        len_input_total,
-        num_of_vertices,
-        d_model_for_spatial_attn,
-        d_k_for_attn,
-        d_v_for_attn,
-        n_heads_for_attn,
-        task_type=task_type,
-        num_classes=num_classes,
-        output_memory=output_memory,
-        return_internal_states=return_internal_states,
-        use_sde=use_sde,
-        use_dynamic_spatial_for_gcn=use_dynamic_spatial_for_gcn,
-        dynamic_spatial_alpha=dynamic_spatial_alpha,
-    )
+    model = DSTAGNN_submodule(DEVICE, num_of_d_initial_feat, nb_block, initial_in_channels_cheb,
+                             K_cheb, nb_chev_filter, nb_time_filter_block_unused, initial_time_strides,
+                             cheb_polynomials, adj_pa_tensor, adj_TMD_tensor, num_for_predict_per_node,
+                             len_input_total, num_of_vertices, d_model_for_spatial_attn, d_k_for_attn,
+                             d_v_for_attn, n_heads_for_attn,
+                             task_type=task_type, num_classes=num_classes,
+                             output_memory=output_memory,
+                             return_internal_states=return_internal_states,
+                             use_sde=use_sde,
+                             use_dynamic_spatial_for_gcn=use_dynamic_spatial_for_gcn,
+                             dynamic_spatial_alpha=dynamic_spatial_alpha,
+                             use_lead_gating=use_lead_gating,
+                             lead_gate_beta=lead_gate_beta,
+                             lead_gate_gamma=lead_gate_gamma,
+                             lead_gate_temperature=lead_gate_temperature,
+                             lead_gate_g_min=lead_gate_g_min,
+                             lead_gate_hidden=lead_gate_hidden)
 
     for p in model.parameters():
         if p.dim() > 1:

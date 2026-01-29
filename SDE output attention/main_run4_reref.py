@@ -20,6 +20,7 @@ import os
 import random
 import numpy as np
 import math
+import json
 from datetime import timedelta
 
 import torch
@@ -37,7 +38,11 @@ from dataclasses import dataclass, asdict
 from typing import Dict, Any, Optional, Tuple
 
 from dataLoad.preprocess_reref import get_data  # [MOD] 使用带重参考的预处理
-from DSTAGNN_my1 import make_model
+# 兼容：你的工程里可能把文件命名为 DSTAGNN_my1.py 或 New_DSTAGNN_my1.py
+try:
+    from DSTAGNN_my1 import make_model
+except Exception:
+    from New_DSTAGNN_my1 import make_model
 
 
 # -----------------------------------------------------------------------------
@@ -60,6 +65,194 @@ def seed_worker(worker_id: int) -> None:
     random.seed(worker_seed)
 
 
+# ----------------------------------------------------------------------------
+# Export helpers (SDE interpretability export)
+# ----------------------------------------------------------------------------
+
+def ensure_dir(p: str) -> None:
+    if not os.path.exists(p):
+        os.makedirs(p, exist_ok=True)
+
+
+def _write_json(path: str, obj: Dict[str, Any]) -> None:
+    ensure_dir(os.path.dirname(path) if os.path.dirname(path) else ".")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+
+def _save_seq_npz(dir_path: str, sample_tag: str, seq: np.ndarray, label: int, **meta) -> str:
+    """保存对齐 Old 的 seq npz：key 固定用 'seq'，便于复用 build_ml_features_from_fold2.py。"""
+    ensure_dir(dir_path)
+    out_path = os.path.join(dir_path, f"{sample_tag}.npz")
+    np.savez_compressed(out_path, seq=seq.astype(np.float32), label=int(label), **meta)
+    return out_path
+
+
+def _save_arr_npz(dir_path: str, sample_tag: str, arr: np.ndarray, label: int, key: str = "arr", **meta) -> str:
+    """保存通用 npz（例如 raw sat scores）。"""
+    ensure_dir(dir_path)
+    out_path = os.path.join(dir_path, f"{sample_tag}.npz")
+    np.savez_compressed(out_path, **{key: arr.astype(np.float32)}, label=int(label), **meta)
+    return out_path
+
+
+@torch.no_grad()
+def export_sde_analysis_for_loader(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    feat_extractor: "EEGFeatureExtractor",
+    export_root: str,
+    sample_prefix: str,
+    channels_used: list,
+    max_trials: int = -1,
+    save_prob: bool = False,
+) -> None:
+    """
+    导出 New 算法的 SDE（Lead-Gated 后）到 export_root。
+
+    目录结构：
+      export_root/
+        meta.json
+        sde/
+          raw_sat_scores_seq/   (logits: (T,K,N,N))
+          node_entropy_seq/     (seq: (N,T))
+          node_inflow_seq/      (seq: (N,T))
+          lead_gate_g/          (seq: (N,))
+          lead_gate_scores/     (seq: (N,))
+
+    说明：
+      - node_entropy_seq / node_inflow_seq 的保存 key 为 'seq'，并且 shape 为 (N,T)，
+        与 Old 导出保持一致，方便你直接复用 build_ml_features_from_fold2.py。
+      - raw_sat_scores_seq 保存 key 为 'scores'，shape (T,K,N,N)，用于你后续做“跨导联注意力转移”建模。
+    """
+
+    ensure_dir(export_root)
+    sde_root = os.path.join(export_root, "sde")
+    raw_dir = os.path.join(sde_root, "raw_sat_scores_seq")
+    prob_dir = os.path.join(sde_root, "sat_prob_seq")
+    ent_dir = os.path.join(sde_root, "node_entropy_seq")
+    inflow_dir = os.path.join(sde_root, "node_inflow_seq")
+    g_dir = os.path.join(sde_root, "lead_gate_g")
+    gs_dir = os.path.join(sde_root, "lead_gate_scores")
+    for d in [raw_dir, ent_dir, inflow_dir, g_dir, gs_dir]:
+        ensure_dir(d)
+    if save_prob:
+        ensure_dir(prob_dir)
+
+    # 写入一次 meta
+    meta_path = os.path.join(export_root, "meta.json")
+    _write_json(
+        meta_path,
+        {
+            "channels_used": list(channels_used),
+            "use_sde": bool(getattr(model, "use_sde", False)),
+            "use_lead_gating": bool(getattr(model, "use_lead_gating", False)),
+            "fs": int(FS),
+            "bands": [list(b) for b in BANDS],
+            "n_fft": int(N_FFT),
+            "hop": int(HOP),
+            "win": int(WIN),
+            "center": bool(CENTER),
+            "frame_hop_sec": float(HOP / FS),
+            "frame_win_sec": float(N_FFT / FS),
+            "note": "Time axis in exported sequences is feature frames (T_frames), not raw samples.",
+        },
+    )
+
+    trial_counter = 0
+    for bidx, (inputs, labels) in enumerate(loader):
+        inputs = inputs.to(device)
+        labels = labels.to(device)
+
+        # (B,C,T) -> (B,C,N_BANDS,T_frames)
+        x = feat_extractor(inputs)
+
+        # 直接调用模型内置导出 API（来自 DSTAGNN_my1.py 的 export_sde_attention_sequences）
+        if hasattr(model, "export_sde_attention_sequences"):
+            ex = model.export_sde_attention_sequences(
+                x,
+                return_prob=save_prob,
+                return_node_stats=True,
+                include_static_and_gcn=True,
+                detach_to_cpu=True,
+            )
+            sat_scores_seq = ex["sat_scores_seq"].numpy()           # (B,T,K,N,N)
+            sat_prob_seq = ex.get("sat_prob_seq", None) if save_prob else None
+            sat_prob_seq = sat_prob_seq.numpy() if (sat_prob_seq is not None and hasattr(sat_prob_seq, "numpy")) else None
+            node_entropy_seq = ex["node_entropy_seq"].numpy()       # (B,T,N)
+            node_inflow_seq = ex["node_inflow_seq"].numpy()         # (B,T,N)
+            lead_g = ex.get("lead_gate_g", None)
+            lead_scores = ex.get("lead_gate_scores", None)
+            lead_g = lead_g.numpy() if (lead_g is not None and hasattr(lead_g, "numpy")) else None
+            lead_scores = lead_scores.numpy() if (lead_scores is not None and hasattr(lead_scores, "numpy")) else None
+        else:
+            # 极端兼容：若你用的是旧版模型文件且没有该导出函数
+            # 这里退化为只跑 forward(return_internal_states=True) 并从最后一层 states 取 sat_scores_seq。
+            logits, states_list = model(x, return_internal_states=True)
+            last_states = states_list[-1] if isinstance(states_list, (list, tuple)) and len(states_list) > 0 else {}
+            sat_scores_seq_t = last_states.get("sat_scores_seq", None)
+            if sat_scores_seq_t is None:
+                B, C, _, T_frames = x.shape
+                sat_scores_seq_t = torch.zeros(B, T_frames, K_CHEB, C, C, device=x.device)
+            sat_scores_seq = sat_scores_seq_t.detach().cpu().numpy()
+            P = torch.softmax(sat_scores_seq_t, dim=-1)
+            sat_prob_seq = P.detach().cpu().numpy() if save_prob else None
+            ent = -(P.clamp_min(1e-8) * P.clamp_min(1e-8).log()).sum(dim=-1)
+            node_entropy_seq = ent.mean(dim=2).detach().cpu().numpy()
+            node_inflow_seq = P.sum(dim=3).mean(dim=2).detach().cpu().numpy()
+            lead_g = last_states.get("lead_gate_g", None)
+            lead_scores = last_states.get("lead_gate_scores", None)
+            lead_g = lead_g.detach().cpu().numpy() if torch.is_tensor(lead_g) else None
+            lead_scores = lead_scores.detach().cpu().numpy() if torch.is_tensor(lead_scores) else None
+
+        labels_np = labels.detach().cpu().numpy().astype(int)
+
+        B = sat_scores_seq.shape[0]
+        for i in range(B):
+            y = int(labels_np[i])
+            sample_tag = f"{sample_prefix}_t{trial_counter:05d}_y{y}"
+
+            # (T,K,N,N)
+            _save_arr_npz(
+                raw_dir,
+                sample_tag,
+                sat_scores_seq[i],
+                y,
+                key="scores",
+                fs=int(FS),
+                hop=int(HOP),
+                n_fft=int(N_FFT),
+            )
+
+            # 可选：保存 softmax 概率（与 logits 同形状）
+            if save_prob and (sat_prob_seq is not None):
+                _save_arr_npz(
+                    prob_dir,
+                    sample_tag,
+                    sat_prob_seq[i],
+                    y,
+                    key="prob",
+                    fs=int(FS),
+                    hop=int(HOP),
+                    n_fft=int(N_FFT),
+                )
+
+            # (B,T,N) -> (N,T)
+            _save_seq_npz(ent_dir, sample_tag, node_entropy_seq[i].transpose(1, 0), y, fs=int(FS), hop=int(HOP))
+            _save_seq_npz(inflow_dir, sample_tag, node_inflow_seq[i].transpose(1, 0), y, fs=int(FS), hop=int(HOP))
+
+            # lead gate（(N,)）— 保存成 seq，方便你画 g 的分布
+            if lead_g is not None:
+                _save_seq_npz(g_dir, sample_tag, lead_g[i], y, fs=int(FS))
+            if lead_scores is not None:
+                _save_seq_npz(gs_dir, sample_tag, lead_scores[i], y, fs=int(FS))
+
+            trial_counter += 1
+            if max_trials > 0 and trial_counter >= max_trials:
+                return
+
+
 # ================== [MOD] 重参考（rereference）开关 ==================
 # 说明：x' = x - x_ref（例如以 Cz 为参考），建议在标准化之前做（preprocess_reref 已实现）。
 USE_REREF: bool = True
@@ -68,10 +261,7 @@ DROP_REF_CHANNEL: bool = False  # True 会让通道数减少（如 22->21），�
 
 
 # ================== 实验开关（你只需要改这里 4 个） ==================
-USE_SDE: bool = True                # 1) 是否使用 SDE（动态空间注意力）
-#这个组件有问题-->脱离了原始SDE设计思想，不使用无法正常收敛-->需要及时的调整
-
-
+USE_SDE: bool = False                 # 1) 是否使用 SDE（动态空间注意力）
 USE_8_LEADS: bool = False            # 2) 是否使用 8 导联（缩减版）
 USE_FILTERBANK: bool = True         # 3) 是否使用滤波器组分离频带（False=STFT频带功率）
 INPUT_SECONDS: float = 4.0           # 4) 输入长度（2.0 或 4.0）
@@ -115,6 +305,24 @@ CHANNEL_DROPOUT_RESCALE: bool = True  # 是否按 (1-p) 反向缩放以保持期
 PRINT_ATTN_AVG_STATS: bool = True
 ATTN_AVG_CHECK_EVERY: int = 10       # 每隔多少 epoch 打印一次（建议 5~20）
 ATTN_AVG_MAX_BATCHES: int = 10       # 统计时最多跑多少个 batch（越大越准，越慢）
+
+# ================== [新增] SDE 导出开关（用于解释性/特征工程） ==================
+# 目标：把 New 算法里“经 Lead-Gating 引导后、不再平均化的 SDE 动态空间注意力”导出到硬盘。
+# 导出结构尽量对齐你 Old 的 analysis/sde/ 目录，方便复用 build_ml_features_from_fold2.py 等脚本。
+EXPORT_SDE_TO_DISK: bool = True
+
+# 是否同时导出 sat_prob_seq（softmax 后的概率）。
+# 注意：概率体积与 logits 相同，会增加磁盘占用；通常只存 logits 即可。
+EXPORT_SDE_SAVE_PROB: bool = False
+
+# 最多导出多少个 trial（-1 表示全部）。可用环境变量覆盖：EXPORT_MAX_TRIALS=200 python ...
+EXPORT_SDE_MAX_TRIALS: int = int(os.environ.get("EXPORT_MAX_TRIALS", "-1"))
+
+# 导出到每个 subject 的 ckpt 目录下的哪个子目录名
+EXPORT_SDE_DIRNAME: str = "analysis"
+
+# 导出哪个 split："test"(Session E) 最常用；你也可以改成 "val"(Session T 验证集) 用于对照
+EXPORT_SDE_SPLIT: str = "test"
 
 # 输入裁剪方式（不是 4 个核心参数之一，但通常不需要改）
 CROP_MODE: str = "start"             # "start" 或 "center"
@@ -1216,6 +1424,39 @@ def main():
             print(f"BestVal : epoch={loaded_best_epoch} (Session T 验证集)")
         print(f"Test    : acc={test_metrics['accuracy']:.4f} | f1={test_metrics['f1_macro']:.4f}  (Session E 测试集)")
         print("=" * 60)
+
+        # ----------------- 8) [新增] 导出 SDE（Lead-Gated 后的动态空间注意力） -----------------
+        # 目的：让 New 的 SDE 也像 Old 一样落盘，便于你后续做“跨导联注意力转移”建模/画图/ML。
+        if EXPORT_SDE_TO_DISK:
+            if not USE_SDE:
+                print(
+                    "[ExportSDE] 警告：当前 USE_SDE=False，因此导出的 sat_scores_seq 将是全零占位。"
+                    "如果你想分析 New 的动态空间注意力，请把 USE_SDE=True。"
+                )
+
+            split = (EXPORT_SDE_SPLIT or "test").lower()
+            if split == "train":
+                export_loader = train_loader
+            elif split == "val":
+                export_loader = val_loader
+            else:
+                export_loader = test_loader
+
+            analysis_root = os.path.join(save_root, f"sub{subject}", f"{EXPORT_SDE_DIRNAME}_{exp_tag}")
+            print(f"[ExportSDE] 开始导出 SDE 到: {analysis_root} | split={split} | max_trials={EXPORT_SDE_MAX_TRIALS}")
+
+            export_sde_analysis_for_loader(
+                model=final_model,
+                loader=export_loader,
+                device=device,
+                feat_extractor=feat_extractor,
+                export_root=analysis_root,
+                sample_prefix=f"S{subject}_{split}",
+                channels_used=channels_used,
+                max_trials=EXPORT_SDE_MAX_TRIALS,
+                save_prob=EXPORT_SDE_SAVE_PROB,
+            )
+            print("[ExportSDE] 导出完成。")
 
     if is_distributed:
         dist.destroy_process_group()
