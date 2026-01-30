@@ -1,37 +1,48 @@
-# coding: utf-8
-"""main_transformer_encoder_attn_avg.py
+from __future__ import annotations
 
-Transformer 基础 Encoder 结构，用于在 BCICIV-2a (Session T -> Session E) 上验证
-“注意力平均化(Attention Averaging)”现象。
+"""
+main_transformer_encoder_attn_avg.py
 
-依赖：
-  - preprocess.py  (提供 get_data)
-  - LoadData.py    (preprocess 会 import 它)
+Transformer 基础 Encoder 结构，用于在 BCICIV-2a 上验证“注意力平均化(Attention Averaging)”现象。
 
-输出：
-  1) Test accuracy
-  2) Test macro-F1
-  3) sklearn classification_report（test）
-  4) 注意力平均化的定量证据（attention entropy / 与 uniform 的距离等）
-  5) 保存 test 预测结果 CSV、以及每层每头的平均注意力矩阵 .npy
+在你现有版本基础上新增：
+1) 支持在 Session T 内部做 8:2 划分（train/test），用于“训练集内部检验”；
+2) 可选择运行：
+   - official : 官方协议 Train(Session T) -> Test(Session E)
+   - within   : Session T 内部 8:2 划分
+   - both     : 两者都跑（默认）
+3) 对每个实验，输出：
+   - Test acc、Test macro-F1、classification_report
+   - 保存 predictions_*.csv
+   - 注意力平均化证据（CLS attention mean + stats JSON）
+   - （可选）也对 train/val 进行评估与保存（便于对比）
 
-运行：
+依赖（同目录或 PYTHONPATH 可见）：
+  - preprocess.py 或 preprocess_reref.py（优先使用 preprocess_reref，如果存在）
+  - LoadData.py
+
+运行示例：
+  # 同时跑 official + within (默认)
   python main_transformer_encoder_attn_avg.py --subject 1 --epochs 200 --batch_size 32
 
-数据路径说明（关键修复点）：
-  你的工程结构是：
-    Only_Encoder/dataLoad/
+  # 只跑 Session T 的 8:2
+  python main_transformer_encoder_attn_avg.py --subject 1 --exp_mode within --within_test_ratio 0.2
+
+  # 只跑官方协议
+  python main_transformer_encoder_attn_avg.py --subject 1 --exp_mode official
+
+数据目录：
+  你的工程常见结构：
+    dataLoad/
       ├─ main_transformer_encoder_attn_avg.py
-      ├─ preprocess.py
+      ├─ preprocess.py / preprocess_reref.py
       ├─ LoadData.py
       └─ BCICIV_2a/
           ├─ s1/A01T.mat ...
           └─ ...
-  因此默认数据目录应为 ./BCICIV_2a 而不是 ./dataLoad/BCICIV_2a。
-  本脚本会自动在多个候选位置寻找 BCICIV_2a 根目录，避免出现 dataLoad/dataLoad 的重复路径。
-"""
 
-from __future__ import annotations
+  默认会自动寻找 BCICIV_2a 根目录；也可用 --data_dir 显式指定。
+"""
 
 import os
 import json
@@ -39,7 +50,7 @@ import math
 import random
 import argparse
 from dataclasses import asdict, dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 
 import numpy as np
 
@@ -50,23 +61,45 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.metrics import classification_report
+from sklearn.preprocessing import StandardScaler
+
 
 # -----------------------------------------------------------------------------
 # Import your existing data loader / preprocessing utilities
+#   - 优先 preprocess_reref.get_data（如果存在）
+#   - 否则 fallback 到 preprocess.get_data
 # -----------------------------------------------------------------------------
+_GET_DATA = None
+_PREPROCESS_NAME = None
+_HAS_REREF_ARGS = False
+
 try:
-    from preprocess import get_data
-except ImportError as e:
-    raise ImportError(
-        "无法 import preprocess.get_data。请把 main_transformer_encoder_attn_avg.py 与 preprocess.py 放在同一目录，"
-        "或把包含 preprocess.py 的目录加入 PYTHONPATH。"
-    ) from e
+    from preprocess_reref import get_data as _get_data  # type: ignore
+    _GET_DATA = _get_data
+    _PREPROCESS_NAME = "preprocess_reref"
+except Exception:
+    try:
+        from preprocess import get_data as _get_data  # type: ignore
+        _GET_DATA = _get_data
+        _PREPROCESS_NAME = "preprocess"
+    except Exception as e:
+        raise ImportError(
+            "无法 import get_data。请确保 preprocess.py 或 preprocess_reref.py 与本脚本同目录，"
+            "或其所在目录已加入 PYTHONPATH。"
+        ) from e
+
+# 检测 get_data 是否支持 rereference 参数（preprocess_reref 支持；preprocess 不支持）
+try:
+    import inspect
+    _sig = inspect.signature(_GET_DATA)
+    _HAS_REREF_ARGS = "rereference" in _sig.parameters
+except Exception:
+    _HAS_REREF_ARGS = False
 
 
 # -----------------------------------------------------------------------------
 # Reproducibility
 # -----------------------------------------------------------------------------
-
 def seed_everything(seed: int = 42) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -79,7 +112,6 @@ def seed_everything(seed: int = 42) -> None:
 # -----------------------------------------------------------------------------
 # Utils: crop / pad
 # -----------------------------------------------------------------------------
-
 def crop_time(X: np.ndarray, target_len: int, mode: str = "start") -> np.ndarray:
     """Crop a (Trials, C, T) array to target_len on time axis."""
     if X.ndim != 3:
@@ -100,12 +132,71 @@ def crop_time(X: np.ndarray, target_len: int, mode: str = "start") -> np.ndarray
 
 
 # -----------------------------------------------------------------------------
+# Standardization (避免 Session T 内部 8:2 时的 test 泄漏)
+# -----------------------------------------------------------------------------
+def _ensure_3d_numpy(X: np.ndarray, name: str) -> np.ndarray:
+    if isinstance(X, list):
+        X = np.asarray(X)
+    if not isinstance(X, np.ndarray):
+        X = np.asarray(X)
+    if X.ndim != 3:
+        raise ValueError(f"{name} must be 3D (Trials,Channels,Time), got {X.shape}")
+    return X
+
+
+def standardize_multiple(
+    X_fit: np.ndarray,
+    X_list: List[np.ndarray],
+    mode: str = "channel_global",
+    eps: float = 1e-6,
+) -> List[np.ndarray]:
+    """
+    用 X_fit 学到的统计量，对 X_list 进行标准化并返回（顺序与输入一致）。
+
+    mode:
+      - channel_global：每通道 1 套 mean/std（在 fit 的 trial*time 上统计）
+      - trial：每 trial、每通道在自身 time 上做 z-score（不依赖 X_fit）
+      - timepoint_across_trials：旧行为（每个 timepoint 1 套统计），在 fit 的 trial 维拟合
+    """
+    X_fit = _ensure_3d_numpy(X_fit, "X_fit")
+    X_list = [_ensure_3d_numpy(x, "X") for x in X_list]
+
+    if mode == "channel_global":
+        mean = X_fit.mean(axis=(0, 2), keepdims=True)  # (1,C,1)
+        std = np.maximum(X_fit.std(axis=(0, 2), keepdims=True), eps)
+        return [(x - mean) / std for x in X_list]
+
+    if mode == "trial":
+        out = []
+        for x in X_list:
+            mean = x.mean(axis=2, keepdims=True)
+            std = np.maximum(x.std(axis=2, keepdims=True), eps)
+            out.append((x - mean) / std)
+        return out
+
+    if mode == "timepoint_across_trials":
+        C = int(X_fit.shape[1])
+        scalers: List[StandardScaler] = []
+        for j in range(C):
+            sc = StandardScaler()
+            sc.fit(X_fit[:, j, :])  # (Trials, Time)
+            scalers.append(sc)
+
+        out = []
+        for x in X_list:
+            x2 = x.copy()
+            for j in range(C):
+                x2[:, j, :] = scalers[j].transform(x2[:, j, :])
+            out.append(x2)
+        return out
+
+    raise ValueError(f"Unknown standardize mode: {mode}")
+
+
+# -----------------------------------------------------------------------------
 # Transformer Encoder with attention weight outputs
 # -----------------------------------------------------------------------------
-
-
 def _mha_supports_avg_flag() -> bool:
-    """PyTorch 1.12+ supports average_attn_weights flag in MultiheadAttention forward."""
     import inspect
     sig = inspect.signature(nn.MultiheadAttention.forward)
     return "average_attn_weights" in sig.parameters
@@ -153,15 +244,14 @@ class EncoderLayerWithAttn(nn.Module):
         return_attn: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
-        Args:
-            x: (B, L, D)
-            return_attn: whether to return attention weights
+        x: (B, L, D)
 
-        Returns:
-            x_out: (B, L, D)
-            attn_w: None or attention weights
-              - if supports_avg_flag and return_attn=True: (B, H, L, L)
-              - else: (B, L, L) (averaged across heads)
+        Return:
+          x_out: (B, L, D)
+          attn_w:
+            - (B,H,L,L) if return_attn and supports_avg_flag
+            - (B,L,L)   if return_attn and older pytorch (head-avg)
+            - None      if return_attn=False
         """
         if return_attn:
             if self._supports_avg_flag:
@@ -267,15 +357,14 @@ class EEGTransformerEncoderClassifier(nn.Module):
             nn.init.trunc_normal_(self.cls_token, std=0.02)
 
     def _to_patches(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B,C,T) -> patches: (B, n_patches, C*patch_size)"""
+        """x: (B,C,T) -> (B,n_patches,C*patch)"""
         B, C, T = x.shape
         if C != self.n_channels:
             raise ValueError(f"Expected C={self.n_channels}, got {C}")
 
         total_len = self.n_patches * self.patch_size
         if T < total_len:
-            pad = total_len - T
-            x = F.pad(x, (0, pad), mode="constant", value=0.0)
+            x = F.pad(x, (0, total_len - T), mode="constant", value=0.0)
         elif T > total_len:
             x = x[:, :, :total_len]
 
@@ -310,7 +399,6 @@ class EEGTransformerEncoderClassifier(nn.Module):
 # -----------------------------------------------------------------------------
 # Training / evaluation
 # -----------------------------------------------------------------------------
-
 def to_device(batch, device):
     x, y = batch
     return x.to(device, non_blocking=True), y.to(device, non_blocking=True)
@@ -372,7 +460,6 @@ def train_one_epoch(
 # -----------------------------------------------------------------------------
 # Attention averaging analysis
 # -----------------------------------------------------------------------------
-
 @dataclass
 class AttnAveragingStats:
     mean_entropy: float
@@ -399,11 +486,7 @@ def collect_mean_attention(
     device: torch.device,
     max_batches: int = 20,
 ) -> np.ndarray:
-    """Collect mean attention matrices per layer/head over a subset of data.
-
-    Returns:
-        mean_attn: (num_layers, num_heads(or 1), L, L)
-    """
+    """Return mean attention per layer/head: (Layers, Heads(or1), L, L)."""
     model.eval()
     attn_sum = None
     count = 0
@@ -425,7 +508,7 @@ def collect_mean_attention(
         stacked = np.stack(layer_attns, axis=0)  # (Layers,B,H,L,L)
 
         if attn_sum is None:
-            attn_sum = stacked.sum(axis=1)  # sum over B -> (Layers,H,L,L)
+            attn_sum = stacked.sum(axis=1)  # (Layers,H,L,L)
         else:
             attn_sum += stacked.sum(axis=1)
 
@@ -438,7 +521,7 @@ def collect_mean_attention(
 
 
 def compute_attn_averaging_stats(mean_attn: np.ndarray, cls_index: int = 0) -> Dict:
-    """Compute attention-averaging statistics from mean attention (focus CLS query)."""
+    """Compute attention-averaging stats from mean attention (focus CLS query)."""
     if mean_attn.ndim != 4:
         raise ValueError(f"mean_attn must be 4D (layer,head,L,L), got {mean_attn.shape}")
 
@@ -487,37 +570,24 @@ def compute_attn_averaging_stats(mean_attn: np.ndarray, cls_index: int = 0) -> D
 
 
 # -----------------------------------------------------------------------------
-# Path resolving (核心修复点)
+# Path resolving
 # -----------------------------------------------------------------------------
-
 def resolve_bcic2a_root(user_data_dir: Optional[str]) -> str:
-    """Resolve BCICIV_2a root directory robustly.
-
-    Return: absolute path to directory that contains s1/, s2/, ... and description.pdf.
-    """
-    # 1) user specified
+    """Return absolute path to directory that contains s1/, s2/, ... and description.pdf."""
     if user_data_dir is not None and str(user_data_dir).strip() != "":
         p = os.path.abspath(os.path.expanduser(user_data_dir))
 
-        # If user points to parent dir containing BCICIV_2a/
         if os.path.isdir(os.path.join(p, "BCICIV_2a")) and os.path.isdir(os.path.join(p, "BCICIV_2a", "s1")):
             p = os.path.join(p, "BCICIV_2a")
 
         if not os.path.isdir(p):
-            raise FileNotFoundError(
-                f"--data_dir 指向的路径不存在或不是目录: {p}\n"
-                "请传入形如: /path/to/BCICIV_2a （里面包含 s1/..s9/）"
-            )
+            raise FileNotFoundError(f"--data_dir 指向的路径不存在或不是目录: {p}")
 
         if not os.path.isdir(os.path.join(p, "s1")):
-            raise FileNotFoundError(
-                f"--data_dir={p} 不是 BCICIV_2a 根目录（里面未找到 s1/）。\n"
-                "请传入包含 s1/..s9/ 的 BCICIV_2a 目录。"
-            )
+            raise FileNotFoundError(f"--data_dir={p} 不是 BCICIV_2a 根目录（里面未找到 s1/）")
 
         return p
 
-    # 2) auto-detect
     script_dir = os.path.dirname(os.path.abspath(__file__))
     cwd = os.getcwd()
 
@@ -541,136 +611,80 @@ def resolve_bcic2a_root(user_data_dir: Optional[str]) -> str:
 
 
 # -----------------------------------------------------------------------------
-# Main
+# Splitting helpers
 # -----------------------------------------------------------------------------
-
-def build_argparser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser()
-    p.add_argument("--subject", type=int, default=1, help="BCICIV-2a subject id (1..9)")
-    p.add_argument(
-        "--data_dir",
-        type=str,
-        default=None,
-        help="BCICIV_2a 根目录（里面应包含 s1/, s2/, ...）。不传则自动寻找（优先 ./BCICIV_2a）。",
-    )
-    p.add_argument("--seed", type=int, default=42)
-
-    p.add_argument("--epochs", type=int, default=200)
-    p.add_argument("--batch_size", type=int, default=32)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--weight_decay", type=float, default=1e-2)
-    p.add_argument("--val_ratio", type=float, default=0.1)
-
-    p.add_argument(
-        "--input_seconds",
-        type=float,
-        default=4.0,
-        help="进一步裁剪长度(秒)。preprocess.get_data 已默认裁剪 2s~6s(4s)，一般保持 4.0。",
-    )
-    p.add_argument("--fs", type=int, default=250)
-    p.add_argument("--crop_mode", type=str, default="start", choices=["start", "center"])
-
-    p.add_argument("--patch_size", type=int, default=25, help="Temporal patch size in samples")
-    p.add_argument("--d_model", type=int, default=128)
-    p.add_argument("--nhead", type=int, default=8)
-    p.add_argument("--num_layers", type=int, default=4)
-    p.add_argument("--dim_feedforward", type=int, default=256)
-    p.add_argument("--dropout", type=float, default=0.1)
-
-    p.add_argument(
-        "--standardize_mode",
-        type=str,
-        default="channel_global",
-        choices=["channel_global", "trial", "timepoint_across_trials"],
-    )
-
-    p.add_argument("--attn_max_batches", type=int, default=20)
-    p.add_argument("--out_dir", type=str, default="./outputs_transformer_encoder")
-
-    return p
+def stratified_split_indices(y: np.ndarray, test_size: float, seed: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Return (train_idx, test_idx)."""
+    if not (0.0 < float(test_size) < 1.0):
+        raise ValueError(f"test_size must be in (0,1), got {test_size}")
+    sss = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
+    idx = np.arange(len(y))
+    train_idx, test_idx = next(sss.split(idx, y))
+    return train_idx, test_idx
 
 
-def main() -> None:
-    args = build_argparser().parse_args()
-    seed_everything(args.seed)
+# -----------------------------------------------------------------------------
+# Experiment runner
+# -----------------------------------------------------------------------------
+def _save_predictions_csv(path: str, y_true: np.ndarray, y_pred: np.ndarray) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("y_true,y_pred\n")
+        for yt, yp in zip(y_true.tolist(), y_pred.tolist()):
+            f.write(f"{int(yt)},{int(yp)}\n")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # ======= [FIX] robust data dir resolving =======
-    data_root = resolve_bcic2a_root(args.data_dir)
-    if not data_root.endswith(os.sep):
-        data_root = data_root + os.sep
+def _run_one_experiment(
+    exp_name: str,
+    X_train_full_raw: np.ndarray,
+    y_train_full: np.ndarray,
+    eval_sets_raw: Dict[str, Tuple[np.ndarray, np.ndarray]],
+    args: argparse.Namespace,
+    device: torch.device,
+    out_dir: str,
+    n_channels: int,
+    target_len: int,
+) -> Dict[str, Dict]:
+    """
+    exp_name: 'official' / 'within'
+    X_train_full_raw: 用于训练的“全量训练集合”（之后会再从中切 train/val）
+    eval_sets_raw: 需要评估的集合（比如 {'SessionE':(X_E,y_E)} 或 {'T_holdout':(...), 'SessionE':(...)}）
+    """
+    os.makedirs(out_dir, exist_ok=True)
 
-    # Fail-fast sanity check for mat files
-    sub_dir = os.path.join(data_root, f"s{args.subject}")
-    expected_train_mat = os.path.join(sub_dir, f"A0{args.subject}T.mat")
-    expected_test_mat = os.path.join(sub_dir, f"A0{args.subject}E.mat")
-    if not os.path.isdir(sub_dir):
-        raise FileNotFoundError(f"找不到目录: {sub_dir} (data_root={data_root})")
-    if not (os.path.exists(expected_train_mat) and os.path.exists(expected_test_mat)):
-        try:
-            listing = sorted(os.listdir(sub_dir))[:50]
-        except Exception:
-            listing = []
-        raise FileNotFoundError(
-            "未找到预期 .mat 文件：\n"
-            f"  - {expected_train_mat}\n"
-            f"  - {expected_test_mat}\n"
-            f"当前 {sub_dir} 目录前 50 项: {listing}\n"
-        )
+    # 1) 标准化：fit 在 X_train_full_raw 上（不包含任何 eval_sets）
+    keys = list(eval_sets_raw.keys())
+    X_to_std = [X_train_full_raw] + [eval_sets_raw[k][0] for k in keys]
+    X_std_list = standardize_multiple(X_train_full_raw, X_to_std, mode=args.standardize_mode)
 
-    print("=" * 80)
-    print(f"[Path] data_root: {data_root}")
-    print(f"[Path] subject_dir: {sub_dir}")
-    print(f"[Path] train_mat: {expected_train_mat}")
-    print(f"[Path] test_mat : {expected_test_mat}")
-    print("=" * 80)
+    X_train_full = X_std_list[0]
+    eval_sets = {k: (X_std_list[i + 1], eval_sets_raw[k][1]) for i, k in enumerate(keys)}
 
-    # 1) load data (official protocol): preprocess.get_data will append 's{subject}/'
-    X_train, y_train, X_test, y_test, _, _ = get_data(
-        path=data_root,
-        subject=args.subject,
-        LOSO=False,
-        data_type="2a",
-        isStandard=True,
-        standardize_mode=args.standardize_mode,
-    )
-
-    # 2) further crop
-    target_len = int(round(args.input_seconds * args.fs))
-    if target_len > X_train.shape[-1]:
-        raise ValueError(
-            f"--input_seconds 对应长度 {target_len} > preprocess.get_data 输出长度 {X_train.shape[-1]}。"
-            f"请把 input_seconds <= {X_train.shape[-1] / args.fs:.2f}."
-        )
-
-    X_train = crop_time(X_train, target_len=target_len, mode=args.crop_mode)
-    X_test = crop_time(X_test, target_len=target_len, mode=args.crop_mode)
-
-    _, n_channels, _ = X_train.shape
-
-    # 3) split val from Session T
-    sss = StratifiedShuffleSplit(n_splits=1, test_size=args.val_ratio, random_state=args.seed)
-    train_idx, val_idx = next(sss.split(X_train, y_train))
+    # 2) 从 X_train_full 内部分 train/val（用于选 best）
+    if args.val_ratio > 0.0:
+        train_idx, val_idx = stratified_split_indices(y_train_full, test_size=args.val_ratio, seed=args.seed)
+        has_val = True
+    else:
+        train_idx = np.arange(len(y_train_full))
+        val_idx = np.array([], dtype=np.int64)
+        has_val = False
 
     train_ds = TensorDataset(
-        torch.tensor(X_train[train_idx], dtype=torch.float32),
-        torch.tensor(y_train[train_idx], dtype=torch.long),
+        torch.tensor(X_train_full[train_idx], dtype=torch.float32),
+        torch.tensor(y_train_full[train_idx], dtype=torch.long),
     )
-    val_ds = TensorDataset(
-        torch.tensor(X_train[val_idx], dtype=torch.float32),
-        torch.tensor(y_train[val_idx], dtype=torch.long),
-    )
-    test_ds = TensorDataset(
-        torch.tensor(X_test, dtype=torch.float32),
-        torch.tensor(y_test, dtype=torch.long),
-    )
-
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
 
-    # 4) model
+    if has_val:
+        val_ds = TensorDataset(
+            torch.tensor(X_train_full[val_idx], dtype=torch.float32),
+            torch.tensor(y_train_full[val_idx], dtype=torch.long),
+        )
+        val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
+    else:
+        val_ds = None
+        val_loader = None
+
+    # 3) model
     model = EEGTransformerEncoderClassifier(
         n_channels=n_channels,
         input_samples=target_len,
@@ -688,80 +702,360 @@ def main() -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.lr * 0.01)
 
-    # 5) train
+    # 4) train
     best_val_f1 = -1.0
-    out_dir = os.path.join(args.out_dir, f"sub{args.subject}")
-    os.makedirs(out_dir, exist_ok=True)
     ckpt_path = os.path.join(out_dir, "best_model.pth")
 
-    print("=" * 80)
-    print(f"Device: {device}")
-    print(f"Subject: {args.subject}")
-    print(f"Train/Val/Test: {len(train_ds)}/{len(val_ds)}/{len(test_ds)}")
-    print(f"Input: C={n_channels}, T={target_len} ({args.input_seconds}s), patch={args.patch_size}, n_patches={model.n_patches}")
-    print(f"Transformer: d_model={args.d_model}, nhead={args.nhead}, layers={args.num_layers}, ff={args.dim_feedforward}, dropout={args.dropout}")
-    print(f"Standardize mode: {args.standardize_mode}")
+    print("\n" + "=" * 80)
+    print(f"[EXPERIMENT] {exp_name}")
+    print(f"Output dir: {out_dir}")
+    print(f"Train_full size: {X_train_full.shape[0]} | Train/Val split: {len(train_idx)}/{len(val_idx)}")
+    print(f"Eval sets: { {k: v[0].shape[0] for k, v in eval_sets.items()} }")
+    print(f"Input: C={n_channels}, T={target_len}, patch={args.patch_size}, n_patches={model.n_patches}")
+    print(f"Transformer: d_model={args.d_model}, nhead={args.nhead}, layers={args.num_layers}")
+    print(f"Standardize mode: {args.standardize_mode} | preprocess used: {_PREPROCESS_NAME}")
     print("=" * 80)
 
     for epoch in range(1, args.epochs + 1):
         train_loss = train_one_epoch(model, train_loader, optimizer, device)
         scheduler.step()
 
-        val_metrics = evaluate(model, val_loader, device)
-        print(
-            f"Epoch {epoch:03d}/{args.epochs} | "
-            f"Train loss {train_loss:.4f} | "
-            f"Val loss {val_metrics['loss']:.4f} | "
-            f"Val acc {val_metrics['accuracy']:.4f} | "
-            f"Val F1(macro) {val_metrics['f1_macro']:.4f}"
+        if has_val:
+            val_metrics = evaluate(model, val_loader, device)
+            print(
+                f"Epoch {epoch:03d}/{args.epochs} | "
+                f"Train loss {train_loss:.4f} | "
+                f"Val loss {val_metrics['loss']:.4f} | "
+                f"Val acc {val_metrics['accuracy']:.4f} | "
+                f"Val F1(macro) {val_metrics['f1_macro']:.4f}"
+            )
+            if val_metrics["f1_macro"] > best_val_f1:
+                best_val_f1 = val_metrics["f1_macro"]
+                torch.save(model.state_dict(), ckpt_path)
+        else:
+            print(f"Epoch {epoch:03d}/{args.epochs} | Train loss {train_loss:.4f}")
+
+    if not has_val:
+        torch.save(model.state_dict(), ckpt_path)
+
+    # 5) load best/last and evaluate
+    model.load_state_dict(torch.load(ckpt_path, map_location=device))
+
+    results: Dict[str, Dict] = {}
+
+    # 可选：也评估 train / val（方便观测过拟合）
+    if args.eval_train:
+        train_eval_loader = DataLoader(
+            TensorDataset(
+                torch.tensor(X_train_full[train_idx], dtype=torch.float32),
+                torch.tensor(y_train_full[train_idx], dtype=torch.long),
+            ),
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=2,
+            pin_memory=True,
+        )
+        train_metrics = evaluate(model, train_eval_loader, device)
+        results["TrainSplit"] = train_metrics
+
+        print("\n" + "-" * 80)
+        print(f"[EVAL] TrainSplit")
+        print(f"Acc      : {train_metrics['accuracy']:.4f}")
+        print(f"F1(macro): {train_metrics['f1_macro']:.4f}")
+
+        _save_predictions_csv(
+            os.path.join(out_dir, "predictions_TrainSplit.csv"),
+            train_metrics["y_true"],
+            train_metrics["y_pred"],
         )
 
-        if val_metrics["f1_macro"] > best_val_f1:
-            best_val_f1 = val_metrics["f1_macro"]
-            torch.save(model.state_dict(), ckpt_path)
+        if args.attn_on_train:
+            mean_attn = collect_mean_attention(model, train_eval_loader, device=device, max_batches=args.attn_max_batches)
+            stats = compute_attn_averaging_stats(mean_attn, cls_index=0)
+            np.save(os.path.join(out_dir, "mean_attention_TrainSplit.npy"), mean_attn)
+            with open(os.path.join(out_dir, "attention_stats_TrainSplit.json"), "w", encoding="utf-8") as f:
+                json.dump(stats, f, ensure_ascii=False, indent=2)
 
-    # 6) test with best
-    model.load_state_dict(torch.load(ckpt_path, map_location=device))
-    test_metrics = evaluate(model, test_loader, device)
+    if has_val and args.eval_val:
+        val_eval_loader = DataLoader(
+            TensorDataset(
+                torch.tensor(X_train_full[val_idx], dtype=torch.float32),
+                torch.tensor(y_train_full[val_idx], dtype=torch.long),
+            ),
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=2,
+            pin_memory=True,
+        )
+        val_metrics_final = evaluate(model, val_eval_loader, device)
+        results["ValSplit"] = val_metrics_final
 
-    report_str = classification_report(
-        test_metrics["y_true"],
-        test_metrics["y_pred"],
-        digits=4,
-        zero_division=0,
+        print("\n" + "-" * 80)
+        print(f"[EVAL] ValSplit")
+        print(f"Acc      : {val_metrics_final['accuracy']:.4f}")
+        print(f"F1(macro): {val_metrics_final['f1_macro']:.4f}")
+
+        _save_predictions_csv(
+            os.path.join(out_dir, "predictions_ValSplit.csv"),
+            val_metrics_final["y_true"],
+            val_metrics_final["y_pred"],
+        )
+
+        if args.attn_on_val:
+            mean_attn = collect_mean_attention(model, val_eval_loader, device=device, max_batches=args.attn_max_batches)
+            stats = compute_attn_averaging_stats(mean_attn, cls_index=0)
+            np.save(os.path.join(out_dir, "mean_attention_ValSplit.npy"), mean_attn)
+            with open(os.path.join(out_dir, "attention_stats_ValSplit.json"), "w", encoding="utf-8") as f:
+                json.dump(stats, f, ensure_ascii=False, indent=2)
+
+    # 对每个 eval set 输出 classification_report + attention stats
+    for set_name, (X_ev, y_ev) in eval_sets.items():
+        ds = TensorDataset(torch.tensor(X_ev, dtype=torch.float32), torch.tensor(y_ev, dtype=torch.long))
+        loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
+
+        metrics = evaluate(model, loader, device)
+        results[set_name] = metrics
+
+        report_str = classification_report(metrics["y_true"], metrics["y_pred"], digits=4, zero_division=0)
+
+        print("\n" + "=" * 80)
+        print(f"[TEST RESULTS] ({set_name})")
+        print(f"Acc      : {metrics['accuracy']:.4f}")
+        print(f"F1(macro): {metrics['f1_macro']:.4f}")
+        print("\nclassification_report:")
+        print(report_str)
+        print("=" * 80)
+
+        _save_predictions_csv(os.path.join(out_dir, f"predictions_{set_name}.csv"), metrics["y_true"], metrics["y_pred"])
+
+        # attention averaging evidence
+        mean_attn = collect_mean_attention(model, loader, device=device, max_batches=args.attn_max_batches)
+        stats = compute_attn_averaging_stats(mean_attn, cls_index=0)
+
+        np.save(os.path.join(out_dir, f"mean_attention_{set_name}.npy"), mean_attn)
+        with open(os.path.join(out_dir, f"attention_stats_{set_name}.json"), "w", encoding="utf-8") as f:
+            json.dump(stats, f, ensure_ascii=False, indent=2)
+
+        print("\n[ATTENTION AVERAGING EVIDENCE] (CLS attention)")
+        print(json.dumps(stats["global"], ensure_ascii=False, indent=2))
+
+    return results
+
+
+# -----------------------------------------------------------------------------
+# CLI
+# -----------------------------------------------------------------------------
+def build_argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser()
+
+    p.add_argument("--subject", type=int, default=1, help="BCICIV-2a subject id (1..9)")
+    p.add_argument(
+        "--data_dir",
+        type=str,
+        default=None,
+        help="BCICIV_2a 根目录（里面应包含 s1/, s2/, ...）。不传则自动寻找。",
+    )
+    p.add_argument("--seed", type=int, default=42)
+
+    # experiment selection
+    p.add_argument(
+        "--exp_mode",
+        type=str,
+        default="both",
+        choices=["official", "within", "both"],
+        help="official: Train(T)->Test(E); within: Session T 内部 8:2; both: 两者都跑",
+    )
+    p.add_argument(
+        "--within_test_ratio",
+        type=float,
+        default=0.2,
+        help="Session T 内部划分的 test 比例（8:2 即 0.2）",
     )
 
-    print("\n" + "=" * 80)
-    print("[TEST RESULTS] (Session E)")
-    print(f"Test acc      : {test_metrics['accuracy']:.4f}")
-    print(f"Test F1(macro): {test_metrics['f1_macro']:.4f}")
-    print("\nclassification_report(test):")
-    print(report_str)
+    # train
+    p.add_argument("--epochs", type=int, default=200)
+    p.add_argument("--batch_size", type=int, default=32)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--weight_decay", type=float, default=1e-2)
+    p.add_argument("--val_ratio", type=float, default=0.1, help="在训练集合内部再划分 val 的比例（用于选 best）")
+
+    # input
+    p.add_argument(
+        "--input_seconds",
+        type=float,
+        default=4.0,
+        help="进一步裁剪长度(秒)。preprocess.get_data 默认裁剪 2s~6s(4s)，一般保持 4.0。",
+    )
+    p.add_argument("--fs", type=int, default=250)
+    p.add_argument("--crop_mode", type=str, default="start", choices=["start", "center"])
+
+    # transformer
+    p.add_argument("--patch_size", type=int, default=25, help="Temporal patch size in samples")
+    p.add_argument("--d_model", type=int, default=128)
+    p.add_argument("--nhead", type=int, default=8)
+    p.add_argument("--num_layers", type=int, default=4)
+    p.add_argument("--dim_feedforward", type=int, default=256)
+    p.add_argument("--dropout", type=float, default=0.1)
+
+    # standardization
+    p.add_argument(
+        "--standardize_mode",
+        type=str,
+        default="channel_global",
+        choices=["channel_global", "trial", "timepoint_across_trials"],
+    )
+
+    # preprocess_reref options (only if supported)
+    p.add_argument("--reref", action="store_true", help="启用单点重参考（仅 preprocess_reref 支持）")
+    p.add_argument("--ref_channel", type=str, default="Cz", help="重参考通道名（例如 Cz）")
+    p.add_argument("--drop_ref", action="store_true", help="重参考后删除 ref 通道（通道数会减少 1）")
+
+    # attention analysis
+    p.add_argument("--attn_max_batches", type=int, default=20, help="计算 mean attention 使用多少个 batch（每个评估集合）")
+    p.add_argument("--eval_train", action="store_true", help="额外评估 TrainSplit（不只是 test）")
+    p.add_argument("--eval_val", action="store_true", help="额外评估 ValSplit（不只是 test）")
+    p.add_argument("--attn_on_train", action="store_true", help="对 TrainSplit 也计算注意力证据（更慢）")
+    p.add_argument("--attn_on_val", action="store_true", help="对 ValSplit 也计算注意力证据（更慢）")
+
+    # output
+    p.add_argument("--out_dir", type=str, default="./outputs_transformer_encoder")
+
+    return p
+
+
+def main() -> None:
+    args = build_argparser().parse_args()
+    seed_everything(args.seed)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 1) resolve data root
+    data_root = resolve_bcic2a_root(args.data_dir)
+    if not data_root.endswith(os.sep):
+        data_root = data_root + os.sep
+
+    # Fail-fast check
+    sub_dir = os.path.join(data_root, f"s{args.subject}")
+    expected_train_mat = os.path.join(sub_dir, f"A0{args.subject}T.mat")
+    expected_test_mat = os.path.join(sub_dir, f"A0{args.subject}E.mat")
+    if not (os.path.isdir(sub_dir) and os.path.exists(expected_train_mat) and os.path.exists(expected_test_mat)):
+        raise FileNotFoundError(
+            f"数据路径检查失败。\n"
+            f"sub_dir={sub_dir}\n"
+            f"expected_train_mat={expected_train_mat}\n"
+            f"expected_test_mat ={expected_test_mat}\n"
+        )
+
+    # 2) load raw data (不在 get_data 内部做标准化，避免 within split 的 test 泄漏)
+    get_data_kwargs = dict(
+        path=data_root,
+        subject=args.subject,
+        LOSO=False,
+        data_type="2a",
+        isStandard=False,  # <-- 关键：我们自己标准化
+    )
+
+    # 如果当前 get_data 支持 rereference 参数，则允许用户开启
+    if _HAS_REREF_ARGS:
+        get_data_kwargs.update(
+            dict(
+                rereference=bool(args.reref),
+                ref_channel=args.ref_channel,
+                drop_ref=bool(args.drop_ref),
+            )
+        )
+    else:
+        if args.reref or args.drop_ref:
+            print(
+                "[WARN] 当前导入的 get_data 不支持 rereference 参数（可能使用的是 preprocess.py）。"
+                "已忽略 --reref/--drop_ref。"
+            )
+
+    X_T, y_T, X_E, y_E, _, _ = _GET_DATA(**get_data_kwargs)
+
+    # 3) further crop (统一输入长度)
+    target_len = int(round(args.input_seconds * args.fs))
+    if target_len > X_T.shape[-1]:
+        raise ValueError(
+            f"--input_seconds 对应长度 {target_len} > get_data 输出长度 {X_T.shape[-1]}。"
+            f"请把 input_seconds <= {X_T.shape[-1] / args.fs:.2f}."
+        )
+
+    X_T = crop_time(X_T, target_len=target_len, mode=args.crop_mode)
+    X_E = crop_time(X_E, target_len=target_len, mode=args.crop_mode)
+
+    n_channels = int(X_T.shape[1])
+
+    # 4) build output tag
+    reref_tag = ""
+    if _HAS_REREF_ARGS and args.reref:
+        reref_tag = f"_reref-{args.ref_channel}_drop{int(args.drop_ref)}"
+    base_out = os.path.join(args.out_dir, f"sub{args.subject}{reref_tag}")
+    os.makedirs(base_out, exist_ok=True)
+
+    print("=" * 80)
+    print(f"[Device] {device}")
+    print(f"[Data ] BCICIV_2a root: {data_root}")
+    print(f"[Data ] preprocess used: {_PREPROCESS_NAME} | reref_supported={_HAS_REREF_ARGS}")
+    print(f"[Data ] Session T: {X_T.shape} | Session E: {X_E.shape}")
+    print(f"[Exp  ] exp_mode={args.exp_mode} | within_test_ratio={args.within_test_ratio} | val_ratio={args.val_ratio}")
     print("=" * 80)
 
-    # 7) save test predictions
-    pred_path = os.path.join(out_dir, "test_predictions.csv")
-    with open(pred_path, "w", encoding="utf-8") as f:
-        f.write("y_true,y_pred\n")
-        for yt, yp in zip(test_metrics["y_true"].tolist(), test_metrics["y_pred"].tolist()):
-            f.write(f"{yt},{yp}\n")
+    # 5) run experiments
+    all_results: Dict[str, Dict] = {}
 
-    # 8) attention averaging evidence on TEST
-    mean_attn = collect_mean_attention(model, test_loader, device=device, max_batches=args.attn_max_batches)
-    stats = compute_attn_averaging_stats(mean_attn, cls_index=0)
+    if args.exp_mode in ("official", "both"):
+        out_dir_official = os.path.join(base_out, "official_T_to_E")
+        res_official = _run_one_experiment(
+            exp_name="official (Train=T, Test=E)",
+            X_train_full_raw=X_T,
+            y_train_full=y_T,
+            eval_sets_raw={"SessionE": (X_E, y_E)},
+            args=args,
+            device=device,
+            out_dir=out_dir_official,
+            n_channels=n_channels,
+            target_len=target_len,
+        )
+        all_results["official"] = res_official
 
-    attn_npy_path = os.path.join(out_dir, "mean_attention_layer_head_L_L.npy")
-    np.save(attn_npy_path, mean_attn)
+    if args.exp_mode in ("within", "both"):
+        # Session T 内部 8:2 划分（train_full / holdout_test）
+        train_full_idx, holdout_idx = stratified_split_indices(y_T, test_size=args.within_test_ratio, seed=args.seed)
 
-    attn_stats_path = os.path.join(out_dir, "attention_averaging_stats.json")
-    with open(attn_stats_path, "w", encoding="utf-8") as f:
-        json.dump(stats, f, ensure_ascii=False, indent=2)
+        X_T_trainfull = X_T[train_full_idx]
+        y_T_trainfull = y_T[train_full_idx]
+        X_T_holdout = X_T[holdout_idx]
+        y_T_holdout = y_T[holdout_idx]
 
-    print("\n[ATTENTION AVERAGING EVIDENCE] (CLS attention on test)")
-    print(f"Saved mean attention: {attn_npy_path}")
-    print(f"Saved stats JSON    : {attn_stats_path}")
-    print("Global stats:")
-    print(json.dumps(stats["global"], ensure_ascii=False, indent=2))
+        out_dir_within = os.path.join(
+            base_out, f"within_T_split_{int(round((1-args.within_test_ratio)*100))}_{int(round(args.within_test_ratio*100))}"
+        )
+        res_within = _run_one_experiment(
+            exp_name=f"within (Train=T*{1-args.within_test_ratio:.2f}, Test=T*{args.within_test_ratio:.2f})",
+            X_train_full_raw=X_T_trainfull,
+            y_train_full=y_T_trainfull,
+            eval_sets_raw={
+                "T_holdout": (X_T_holdout, y_T_holdout),
+                # 额外：也看一下该模型在 Session E 上表现（非官方协议，但便于对照）
+                "SessionE": (X_E, y_E),
+            },
+            args=args,
+            device=device,
+            out_dir=out_dir_within,
+            n_channels=n_channels,
+            target_len=target_len,
+        )
+        all_results["within"] = res_within
+
+    # 6) save summary json
+    summary_path = os.path.join(base_out, "summary_results.json")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(all_results, f, ensure_ascii=False, indent=2)
+
+    print("\n" + "=" * 80)
+    print(f"[DONE] Summary saved: {summary_path}")
+    print("=" * 80)
 
 
 if __name__ == "__main__":
