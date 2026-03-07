@@ -1294,7 +1294,7 @@ def build_argparser() -> argparse.ArgumentParser:
     )
 
     # train
-    p.add_argument("--epochs", type=int, default=200)
+    p.add_argument("--epochs", type=int, default=500)
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight_decay", type=float, default=1e-2)
